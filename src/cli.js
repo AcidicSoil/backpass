@@ -32,6 +32,7 @@ const OPTIONS = {
 
   since: { type: "string" },
   harness: { type: "string" },
+  "chatgpt-export": { type: "string", multiple: true },
   jobs: { type: "string" },
   strict: { type: "boolean" },
   "include-cursor-ide": { type: "boolean" },
@@ -82,9 +83,11 @@ COMMANDS
 
 COLLECT SAMPLES
   --since <dur>            only sessions newer than this (30d, 12h, 2w, all)  [30d]
-  --harness <a,b>          limit to these harnesses
-                           (claude, codex, pi, opencode, grok, cursor, hermes)
-  --strict                 deterministic associations only (tiers 1, 1.5, and 2)
+  --harness <a,b>          limit to these transcript sources
+                           (claude, codex, pi, opencode, grok, cursor, hermes, chatgpt)
+  --chatgpt-export <path>  use OpenAI JSON or Nexus Markdown ChatGPT exports
+                           instead of local harness sessions (repeatable)
+  --strict                 deterministic associations only (tiers 0, 1, 1.5, and 2)
   --include-cursor-ide     also scan the Cursor IDE store (best-effort, v1.1 preview)
   --limit <n>              analyze at most N transcripts this run (newest first)
   --max-transcripts <n>    cap per run; past it a recency-weighted sticky sample
@@ -134,6 +137,8 @@ or below 60 columns - stdout and --json output are identical either way.
 EXAMPLES
   backpass                                  a full run, ending with a proposal
   backpass scan --since 7d --strict         what would be collected, deterministic only
+  backpass scan --chatgpt-export ~/Downloads/export/conversations.json
+  backpass scan --chatgpt-export ~/.wiki/Nexus/Conversations/chatgpt --since all
   backpass --synthesis-agent claude --synthesis-model claude-opus-5
   backpass apply --no-ui                    review and write from the terminal
 `;
@@ -148,6 +153,10 @@ function overridesFrom(values) {
       .split(",")
       .map((h) => h.trim())
       .filter(Boolean);
+  }
+  if (values["chatgpt-export"]?.length) {
+    overrides.discovery.chatgptExports = values["chatgpt-export"];
+    if (!values.harness) overrides.discovery.harnesses = ["chatgpt"];
   }
   if (values["include-cursor-ide"]) overrides.discovery.includeCursorIde = true;
   if (values.jobs) overrides.jobs = toInt(values.jobs, "--jobs");

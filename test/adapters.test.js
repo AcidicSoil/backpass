@@ -8,12 +8,14 @@ import { DatabaseSync } from "node:sqlite";
 
 import * as claude from "../src/discovery/adapters/claude.js";
 import * as codex from "../src/discovery/adapters/codex.js";
+import * as chatgpt from "../src/discovery/adapters/chatgpt.js";
 import * as pi from "../src/discovery/adapters/pi.js";
 import * as grok from "../src/discovery/adapters/grok.js";
 import * as cursorCli from "../src/discovery/adapters/cursor-cli.js";
 import * as hermes from "../src/discovery/adapters/hermes.js";
 import { statOrNull } from "../src/discovery/adapters/shared.js";
 import { associate } from "../src/discovery/association.js";
+import { discoverTranscripts } from "../src/discovery/index.js";
 
 const FIXTURES = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
 
@@ -117,6 +119,97 @@ test("codex adapter keeps user/assistant turns and skips developer scaffolding",
   assert.equal(toolCall.name, "shell");
   assert.equal(toolCall.input.command, "npm test");
   assert.equal(toolCall.result, "1 failing");
+});
+
+test("chatgpt export adapter discovers current conversations and reads only the active branch", async () => {
+  const file = path.join(FIXTURES, "chatgpt-conversations.json");
+  const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "backpass-chatgpt-state-"));
+  const rows = await chatgpt.discover({
+    cutoffMs: Date.UTC(2026, 7, 1),
+    repo: { root: "/repo/demo" },
+    config: { discovery: { chatgptExports: [file] }, state: { root: stateRoot } },
+  });
+
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].id, "chatgpt-current");
+  assert.equal(rows[0].title, "Exported parser review");
+  assert.equal(rows[0].association.tier, 0);
+  assert.equal(rows[0].association.confidence, "explicit");
+
+  const { events, model } = chatgpt.read({ path: rows[0].path, nativeId: rows[0].id, extra: rows[0].extra });
+  assert.equal(model, "gpt-5.6-sol");
+  assert.deepEqual(
+    messages(events).map((m) => `${m.role}: ${m.text}`),
+    [
+      "user: Open a PR for the parser fix.",
+      "assistant: I will inspect the export format first.",
+      "user: Use the exported conversation, not a CLI session.",
+      "assistant: Implemented and verified.",
+    ],
+  );
+  assert.ok(!JSON.stringify(events).includes("IGNORE ALTERNATE BRANCH"));
+
+  const rawPath = chatgpt.rawPath({ extra: rows[0].extra });
+  const raw = JSON.parse(fs.readFileSync(rawPath, "utf8"));
+  assert.equal(raw.id, "chatgpt-current");
+  assert.ok(!JSON.stringify(raw).includes("Old unrelated chat"), "raw escape hatch contains only the selected chat");
+});
+
+test("chatgpt export adapter reads recursive Nexus Markdown archives and collapses repeated export files", () => {
+  const fixture = fs.readFileSync(path.join(FIXTURES, "chatgpt-nexus-conversation.md"), "utf8");
+  const exportRoot = fs.mkdtempSync(path.join(os.tmpdir(), "backpass-chatgpt-nexus-"));
+  const nested = path.join(exportRoot, "2026", "07");
+  fs.mkdirSync(nested, { recursive: true });
+  const original = path.join(nested, "Wiki export parser review.md");
+  const duplicate = path.join(nested, "Wiki export parser review (1).md");
+  fs.writeFileSync(original, fixture);
+  fs.writeFileSync(
+    duplicate,
+    `${fixture}\n\n---\n>[!nexus_user] **User** - 07/01/2026 at 7:05:00 AM\n> Verify repeated export files are counted once.\n<!-- UID: wiki-user-2 -->\n`,
+  );
+  fs.writeFileSync(path.join(nested, "ordinary-note.md"), "# Not an exported conversation\n");
+
+  const rows = chatgpt.discover({
+    cutoffMs: Date.UTC(2026, 5, 1),
+    repo: { name: "demo", root: "/repo/demo" },
+    config: { discovery: { chatgptExports: [exportRoot] }, state: { root: path.join(exportRoot, ".state") } },
+  });
+
+  assert.equal(rows.length, 1, "repeated Nexus export files for one conversation_id count once");
+  assert.equal(rows[0].id, "wiki-current");
+  assert.equal(rows[0].title, "Wiki export parser review");
+  assert.equal(rows[0].extra.sourceFormat, "nexus-markdown");
+  assert.equal(rows[0].extra.sourcePath, duplicate, "the larger duplicate is treated as the more complete copy");
+
+  const { events, model } = chatgpt.read({ path: rows[0].path, nativeId: rows[0].id, extra: rows[0].extra });
+  assert.equal(model, "gpt-5.6-sol");
+  assert.deepEqual(
+    messages(events).map((m) => `${m.role}: ${m.text}`),
+    [
+      "user: Use the exported conversation from `~/.wiki`.\nPreserve multiline Markdown.",
+      "assistant: I will parse the Nexus Markdown format directly.",
+      "user: Verify repeated export files are counted once.",
+    ],
+  );
+  assert.equal(chatgpt.rawPath({ path: rows[0].path, extra: rows[0].extra }), duplicate);
+});
+
+test("explicit ChatGPT exports participate in normal discovery and survive --strict", async () => {
+  const file = path.join(FIXTURES, "chatgpt-conversations.json");
+  const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "backpass-chatgpt-discovery-"));
+  const cache = { version: 1, entries: {} };
+  const config = {
+    discovery: { harnesses: ["chatgpt"], since: "all", worktreeGlobs: [], chatgptExports: [file] },
+    state: { root: stateRoot, readScanCache: () => cache, writeScanCache: () => {} },
+  };
+  const repo = { name: "demo", root: "/repo/demo", worktrees: ["/repo/demo"], remotes: [] };
+
+  const result = await discoverTranscripts({ repo, config, strict: true });
+
+  assert.deepEqual(result.transcripts.map((t) => t.nativeId).sort(), ["chatgpt-current", "chatgpt-old"]);
+  assert.equal(result.perHarness.chatgpt.matched, 2);
+  assert.ok(result.transcripts.every((t) => t.association.tier === 0));
+  assert.ok(result.transcripts.every((t) => t.interaction === "interactive"));
 });
 
 test("pi adapter reads the session header and drops thinking blocks", () => {

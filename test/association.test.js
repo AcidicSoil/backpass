@@ -95,6 +95,7 @@ test("tier 1.5: a live sibling clone is deterministic, not a foreign live path",
 });
 
 test("--strict keeps only the deterministic tiers", () => {
+  assert.equal(passesStrict({ tier: 0 }, true), true);
   assert.equal(passesStrict({ tier: 1 }, true), true);
   assert.equal(passesStrict({ tier: 1.5 }, true), true);
   assert.equal(passesStrict({ tier: 2 }, true), true);

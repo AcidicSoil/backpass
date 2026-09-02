@@ -6,6 +6,8 @@ import { normalizeRemote } from "../repo.js";
 /**
  * Association tiers (design section 2.1, plus sibling clones).
  *
+ *   tier 0    deterministic  - an imported transcript source was explicitly attached
+ *                              to this repo by the user
  *   tier 1    deterministic  - transcript cwd is (or sits under) a live worktree path
  *   tier 1.5  deterministic  - live cwd under a local clone that shares a git remote
  *                              (sibling worktrees `git worktree list` cannot see).
