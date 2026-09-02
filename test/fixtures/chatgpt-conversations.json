@@ -1,0 +1,169 @@
+[
+  {
+    "id": "chatgpt-current",
+    "conversation_id": "chatgpt-current",
+    "title": "Exported parser review",
+    "create_time": 1788264000,
+    "update_time": 1788264600,
+    "current_node": "a2",
+    "mapping": {
+      "root": {
+        "id": "root",
+        "parent": null,
+        "children": [
+          "u1"
+        ],
+        "message": null
+      },
+      "u1": {
+        "id": "u1",
+        "parent": "root",
+        "children": [
+          "a1",
+          "branch"
+        ],
+        "message": {
+          "author": {
+            "role": "user"
+          },
+          "create_time": 1788264000,
+          "content": {
+            "content_type": "text",
+            "parts": [
+              "Open a PR for the parser fix."
+            ]
+          },
+          "metadata": {}
+        }
+      },
+      "a1": {
+        "id": "a1",
+        "parent": "u1",
+        "children": [
+          "u2"
+        ],
+        "message": {
+          "author": {
+            "role": "assistant"
+          },
+          "create_time": 1788264060,
+          "content": {
+            "content_type": "text",
+            "parts": [
+              "I will inspect the export format first."
+            ]
+          },
+          "metadata": {
+            "model_slug": "gpt-5.6-sol"
+          }
+        }
+      },
+      "u2": {
+        "id": "u2",
+        "parent": "a1",
+        "children": [
+          "a2"
+        ],
+        "message": {
+          "author": {
+            "role": "user"
+          },
+          "create_time": 1788264300,
+          "content": {
+            "content_type": "text",
+            "parts": [
+              "Use the exported conversation, not a CLI session."
+            ]
+          },
+          "metadata": {}
+        }
+      },
+      "a2": {
+        "id": "a2",
+        "parent": "u2",
+        "children": [],
+        "message": {
+          "author": {
+            "role": "assistant"
+          },
+          "create_time": 1788264600,
+          "content": {
+            "content_type": "text",
+            "parts": [
+              "Implemented and verified."
+            ]
+          },
+          "metadata": {
+            "model_slug": "gpt-5.6-sol"
+          }
+        }
+      },
+      "branch": {
+        "id": "branch",
+        "parent": "u1",
+        "children": [],
+        "message": {
+          "author": {
+            "role": "assistant"
+          },
+          "create_time": 1788264100,
+          "content": {
+            "content_type": "text",
+            "parts": [
+              "IGNORE ALTERNATE BRANCH"
+            ]
+          },
+          "metadata": {}
+        }
+      }
+    }
+  },
+  {
+    "id": "chatgpt-old",
+    "conversation_id": "chatgpt-old",
+    "title": "Old unrelated chat",
+    "create_time": 1735689600,
+    "update_time": 1735689660,
+    "current_node": "old-a",
+    "mapping": {
+      "old-u": {
+        "id": "old-u",
+        "parent": null,
+        "children": [
+          "old-a"
+        ],
+        "message": {
+          "author": {
+            "role": "user"
+          },
+          "create_time": 1735689600,
+          "content": {
+            "content_type": "text",
+            "parts": [
+              "Old request"
+            ]
+          },
+          "metadata": {}
+        }
+      },
+      "old-a": {
+        "id": "old-a",
+        "parent": "old-u",
+        "children": [],
+        "message": {
+          "author": {
+            "role": "assistant"
+          },
+          "create_time": 1735689660,
+          "content": {
+            "content_type": "text",
+            "parts": [
+              "Old reply"
+            ]
+          },
+          "metadata": {}
+        }
+      }
+    }
+  }
+]

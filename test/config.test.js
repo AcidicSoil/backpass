@@ -66,6 +66,18 @@ test("repo config overrides defaults, and CLI flags override both", () => {
   assert.equal(withFlags.analysis.model, "gpt-5.2");
 });
 
+test("ChatGPT exports are opt-in and can replace the default local-session corpus", () => {
+  const defaults = loadConfig(tempRepo());
+  assert.deepEqual(defaults.discovery.chatgptExports, []);
+  assert.ok(!defaults.discovery.harnesses.includes("chatgpt"));
+
+  const configured = loadConfig(
+    tempRepo({ discovery: { harnesses: ["chatgpt"], chatgptExports: ["exports/conversations.json"] } }),
+  );
+  assert.deepEqual(configured.discovery.chatgptExports, ["exports/conversations.json"]);
+  assert.deepEqual(configured.discovery.harnesses, ["chatgpt"]);
+});
+
 test("--include-cursor-ide is the only way the deferred store is scanned", () => {
   const config = loadConfig(tempRepo(), { discovery: { includeCursorIde: true } });
   assert.ok(config.discovery.harnesses.includes("cursor-ide"));
@@ -82,6 +94,8 @@ test("invalid config values fail loudly with a usable message", () => {
   assert.throws(() => loadConfig(tempRepo({ minGapEvidence: 0 })), UserError);
   assert.throws(() => loadConfig(tempRepo({ discovery: { since: "yesterday" } })), UserError);
   assert.throws(() => loadConfig(tempRepo({ discovery: { cloneRoots: "home" } })), UserError);
+  assert.throws(() => loadConfig(tempRepo({ discovery: { chatgptExports: "conversations.json" } })), UserError);
+  assert.throws(() => loadConfig(tempRepo({ discovery: { harnesses: ["chatgpt"] } })), UserError);
   assert.throws(() => loadConfig(tempRepo("{ not json")), UserError);
   assert.throws(() => loadConfig(tempRepo('"a bare string"')), UserError);
 });

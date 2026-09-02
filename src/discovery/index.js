@@ -1,5 +1,6 @@
 import * as claude from "./adapters/claude.js";
 import * as codex from "./adapters/codex.js";
+import * as chatgpt from "./adapters/chatgpt.js";
 import * as pi from "./adapters/pi.js";
 import * as grok from "./adapters/grok.js";
 import * as opencode from "./adapters/opencode.js";
@@ -18,6 +19,7 @@ import { transcriptIdentity } from "../transcript.js";
 export const ADAPTERS = {
   claude,
   codex,
+  chatgpt,
   pi,
   grok,
   opencode,
@@ -128,9 +130,11 @@ async function discoverDirect(adapter, { repo, config, cutoffMs, strict, stats }
   const out = [];
   for (const row of rows) {
     stats.scanned += 1;
-    const association = associate({ cwd: row.cwd, remotes: row.remotes || [], gitRoot: row.gitRoot }, repo, {
-      worktreeGlobs: config.discovery.worktreeGlobs,
-    });
+    const association =
+      row.association ||
+      associate({ cwd: row.cwd, remotes: row.remotes || [], gitRoot: row.gitRoot }, repo, {
+        worktreeGlobs: config.discovery.worktreeGlobs,
+      });
     if (!passesStrict(association, strict)) {
       stats.skipped += 1;
       continue;

@@ -28,13 +28,14 @@ Your `AGENTS.md` is a set of weights. Every agent session is a forward pass. The
 transcript that session leaves on disk is the loss signal - and today nothing reads it.
 The loop only closes when a human happens to remember a failure and edits the file by hand.
 
-`backpass` closes it. It finds the agent sessions that actually ran in your repo, reads
-what happened in them, and proposes evidence-backed edits to your memory surface - the
-memory file and project skills - under a token budget, gated by you.
+`backpass` closes it. It finds the sessions that actually ran in your repo - or reads
+conversation exports you explicitly attach - and proposes evidence-backed edits to your
+memory surface: the memory file and project skills, under a token budget, gated by you.
 
-- **Local-first** - Reads the transcript stores of seven agent harnesses directly from disk.
-  No API, no upload; transcripts never leave your machine except into an agent you already
-  authenticated, and obvious secrets are redacted before they do.
+- **Local-first** - Reads seven agent-harness transcript stores directly from disk, or an
+  exported conversation file you explicitly select. No API, no upload; transcripts never
+  leave your machine except into an agent you already authenticated, and obvious secrets
+  are redacted before they do.
 - **Evidence-gated** - Every proposed edit carries verbatim quotes from real sessions, a
   new instruction needs evidence from at least two independent sessions, and one run
   proposes at most five edits. Small, noisy, repeated steps - not a rewrite.
@@ -43,8 +44,8 @@ memory file and project skills - under a token budget, gated by you.
 
 ```
 AGENTS.md / CLAUDE.md + skills (the weights)
-  → agent session               (forward pass)
-  → transcript on disk          (loss signal)
+  → agent session / conversation (forward pass)
+  → transcript on disk           (loss signal)
   → backpass: collect samples, distill, calculate loss, aggregate gradients
   → backpass: gradient descent  (diffs + skill extractions)
   → you accept or reject        (the human gate)
@@ -72,15 +73,23 @@ cd your-repo
 backpass init      # write .backpassrc.json, exclude .backpass/ via .git/info/exclude
 backpass           # collect samples → calculate loss → aggregate gradients → gradient descent (never writes)
 backpass apply     # review each edit, accept or reject, then write
+
+# Or use extracted ChatGPT export data instead of local CLI-agent sessions:
+backpass scan --chatgpt-export ~/Downloads/chatgpt-export/conversations.json
+backpass --chatgpt-export ~/Downloads/chatgpt-export
 ```
 
 ## How It Works
 
 ### 1. Collect samples - which sessions belong to this repo
 
-backpass reads the local transcript stores of seven harnesses directly. No API, no upload.
+By default backpass reads the local transcript stores of seven harnesses directly. No API,
+no upload. `--chatgpt-export <path>` instead reads an extracted ChatGPT conversation export;
+the flag is repeatable and accepts either a JSON file or a directory containing
+`conversations*.json`. Pass `--harness` as well only when you deliberately want to combine
+the import with local stores.
 
-| Harness        | Store                                          | Repo tie                                            |
+| Source         | Store                                          | Repo tie                                            |
 | -------------- | ---------------------------------------------- | --------------------------------------------------- |
 | **claude**     | `~/.claude/projects/<munged-cwd>/<uuid>.jsonl` | per-line `cwd`                                      |
 | **codex**      | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` | `cwd` + recorded `git.repository_url`               |
@@ -89,6 +98,7 @@ backpass reads the local transcript stores of seven harnesses directly. No API, 
 | **grok**       | `~/.grok/sessions/<encoded-cwd>/<uuid>/`       | `summary.json` `cwd` + `git_remotes`                |
 | **cursor CLI** | `~/.cursor/chats/<md5(cwd)>/<uuid>/`           | `meta.json` `cwd`                                   |
 | **hermes**     | `~/.hermes/state.db` (sqlite)                  | session cwd, with CLI prompt / ACP config fallbacks |
+| **chatgpt**    | extracted `conversations*.json`                | explicit `--chatgpt-export` attachment              |
 
 Claude collection covers `$CLAUDE_CONFIG_DIR/projects` alongside the default store, so a
 relocated config dir does not hide its sessions. The variable is read from backpass's own
@@ -104,7 +114,17 @@ and reads each JSONL file once.
 Hermes collection includes CLI and ACP sessions only. Gateway, cron, and WhatsApp sessions
 are excluded because their recorded cwd belongs to the shared gateway process, not a project.
 
-Association runs in four tiers:
+ChatGPT account exports do not contain a trustworthy repo cwd or git remote. That is why they
+are never auto-discovered: naming an export is the association decision. Every conversation
+in a supplied JSON file is therefore treated as in-scope for the current run. If an account-wide
+export contains unrelated chats, filter it first or pass a JSON file containing only the
+conversations you want to train from. Backpass follows each conversation's active branch and
+ignores abandoned branches. The downloaded ZIP itself is not parsed; extract it first.
+
+Association runs in five tiers:
+
+0. **Tier 0 - deterministic, explicit import.** The user named a conversation export for this
+   repo/run. It survives `--strict` because no repo attribution was guessed.
 
 1. **Tier 1 - deterministic.** The session's cwd is (or sits inside) one of this repo's
    worktrees.
@@ -151,7 +171,10 @@ deterministically: user and assistant turns verbatim, each tool call collapsed t
 dropped, secrets redacted. Typical reduction is **96-99%**.
 
 The distilled trace ends with the path to the raw transcript, so the analysis agent can
-open the original when - and only when - a specific claim needs it.
+open the original when - and only when - a specific claim needs it. For ChatGPT imports,
+Backpass materializes only the selected conversation's active branch under
+`.backpass/imported-transcripts/chatgpt/`; it never exposes the account-wide export as that
+raw escape hatch.
 
 ### 3. Calculate loss - one cheap call per transcript
 

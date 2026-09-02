@@ -8,8 +8,8 @@ export const CONFIG_FILENAME = ".backpassrc.json";
 export const STATE_DIRNAME = ".backpass";
 
 export const ALL_HARNESSES = ["claude", "codex", "pi", "opencode", "grok", "cursor", "hermes"];
-/** Cursor IDE is deferred to v1.1 and only ever runs behind --include-cursor-ide. */
-export const OPT_IN_HARNESSES = ["cursor-ide"];
+/** Sources excluded from default discovery and enabled only by an explicit option/config. */
+export const OPT_IN_HARNESSES = ["cursor-ide", "chatgpt"];
 
 /**
  * The ordered candidate ladders behind the auto-pick (ordered-defaults design, section 8.2).
@@ -83,6 +83,7 @@ export const DEFAULT_CONFIG = {
      * checkout or a parent of checkouts. Discovery only reads git identity there.
      */
     cloneRoots: [],
+    chatgptExports: [],
     minUserTurns: 2,
     includeCursorIde: false,
   },
@@ -220,6 +221,18 @@ function validate(config) {
   parseSince(config.discovery.since);
   if (!Array.isArray(config.discovery.cloneRoots) || config.discovery.cloneRoots.some((p) => typeof p !== "string")) {
     throw new UserError("config.discovery.cloneRoots must be an array of paths");
+  }
+  if (
+    !Array.isArray(config.discovery.chatgptExports) ||
+    config.discovery.chatgptExports.some((p) => typeof p !== "string" || !p.trim())
+  ) {
+    throw new UserError("config.discovery.chatgptExports must be an array of paths");
+  }
+  if (config.discovery.harnesses.includes("chatgpt") && config.discovery.chatgptExports.length === 0) {
+    throw new UserError(
+      "chatgpt transcript discovery requires at least one export path",
+      "pass --chatgpt-export <path>, or set discovery.chatgptExports in .backpassrc.json",
+    );
   }
   return config;
 }
