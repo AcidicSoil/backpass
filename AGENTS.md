@@ -44,8 +44,8 @@ list` only sees this clone. `attachSiblingClones` in `src/repo.js` also searches
   remote, read-only, so Claude sessions whose cwd is a sibling clone still attach
   (tier 1.5). A second full clone with no overlapping remote is never associated.
 - **Transcript formats are undocumented and drift.** File adapters in
-  `src/discovery/adapters/`, including explicit ChatGPT exports, are pinned by golden fixtures
-  in `test/fixtures/`; SQLite
+  `src/discovery/adapters/`, including OpenAI JSON and Nexus Markdown ChatGPT exports, are
+  pinned by golden fixtures in `test/fixtures/`; SQLite
   adapters (opencode, hermes) build tiny temp databases in tests. When a harness changes
   its on-disk shape, fix the adapter and its fixture/test together. Adapters must stay
   fail-soft: an unreadable store warns and is skipped, never throws.

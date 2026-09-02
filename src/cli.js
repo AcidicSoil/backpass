@@ -85,7 +85,7 @@ COLLECT SAMPLES
   --since <dur>            only sessions newer than this (30d, 12h, 2w, all)  [30d]
   --harness <a,b>          limit to these transcript sources
                            (claude, codex, pi, opencode, grok, cursor, hermes, chatgpt)
-  --chatgpt-export <path>  use an extracted ChatGPT conversations JSON file/directory
+  --chatgpt-export <path>  use OpenAI JSON or Nexus Markdown ChatGPT exports
                            instead of local harness sessions (repeatable)
   --strict                 deterministic associations only (tiers 0, 1, 1.5, and 2)
   --include-cursor-ide     also scan the Cursor IDE store (best-effort, v1.1 preview)
@@ -138,6 +138,7 @@ EXAMPLES
   backpass                                  a full run, ending with a proposal
   backpass scan --since 7d --strict         what would be collected, deterministic only
   backpass scan --chatgpt-export ~/Downloads/export/conversations.json
+  backpass scan --chatgpt-export ~/.wiki/Nexus/Conversations/chatgpt --since all
   backpass --synthesis-agent claude --synthesis-model claude-opus-5
   backpass apply --no-ui                    review and write from the terminal
 `;

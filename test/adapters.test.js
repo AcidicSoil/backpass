@@ -155,6 +155,45 @@ test("chatgpt export adapter discovers current conversations and reads only the 
   assert.ok(!JSON.stringify(raw).includes("Old unrelated chat"), "raw escape hatch contains only the selected chat");
 });
 
+test("chatgpt export adapter reads recursive Nexus Markdown archives and collapses repeated export files", () => {
+  const fixture = fs.readFileSync(path.join(FIXTURES, "chatgpt-nexus-conversation.md"), "utf8");
+  const exportRoot = fs.mkdtempSync(path.join(os.tmpdir(), "backpass-chatgpt-nexus-"));
+  const nested = path.join(exportRoot, "2026", "07");
+  fs.mkdirSync(nested, { recursive: true });
+  const original = path.join(nested, "Wiki export parser review.md");
+  const duplicate = path.join(nested, "Wiki export parser review (1).md");
+  fs.writeFileSync(original, fixture);
+  fs.writeFileSync(
+    duplicate,
+    `${fixture}\n\n---\n>[!nexus_user] **User** - 07/01/2026 at 7:05:00 AM\n> Verify repeated export files are counted once.\n<!-- UID: wiki-user-2 -->\n`,
+  );
+  fs.writeFileSync(path.join(nested, "ordinary-note.md"), "# Not an exported conversation\n");
+
+  const rows = chatgpt.discover({
+    cutoffMs: Date.UTC(2026, 5, 1),
+    repo: { name: "demo", root: "/repo/demo" },
+    config: { discovery: { chatgptExports: [exportRoot] }, state: { root: path.join(exportRoot, ".state") } },
+  });
+
+  assert.equal(rows.length, 1, "repeated Nexus export files for one conversation_id count once");
+  assert.equal(rows[0].id, "wiki-current");
+  assert.equal(rows[0].title, "Wiki export parser review");
+  assert.equal(rows[0].extra.sourceFormat, "nexus-markdown");
+  assert.equal(rows[0].extra.sourcePath, duplicate, "the larger duplicate is treated as the more complete copy");
+
+  const { events, model } = chatgpt.read({ path: rows[0].path, nativeId: rows[0].id, extra: rows[0].extra });
+  assert.equal(model, "gpt-5.6-sol");
+  assert.deepEqual(
+    messages(events).map((m) => `${m.role}: ${m.text}`),
+    [
+      "user: Use the exported conversation from `~/.wiki`.\nPreserve multiline Markdown.",
+      "assistant: I will parse the Nexus Markdown format directly.",
+      "user: Verify repeated export files are counted once.",
+    ],
+  );
+  assert.equal(chatgpt.rawPath({ path: rows[0].path, extra: rows[0].extra }), duplicate);
+});
+
 test("explicit ChatGPT exports participate in normal discovery and survive --strict", async () => {
   const file = path.join(FIXTURES, "chatgpt-conversations.json");
   const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "backpass-chatgpt-discovery-"));

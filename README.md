@@ -74,9 +74,14 @@ backpass init      # write .backpassrc.json, exclude .backpass/ via .git/info/ex
 backpass           # collect samples → calculate loss → aggregate gradients → gradient descent (never writes)
 backpass apply     # review each edit, accept or reject, then write
 
-# Or use extracted ChatGPT export data instead of local CLI-agent sessions:
+# Or use exported ChatGPT conversations instead of local CLI-agent sessions:
 backpass scan --chatgpt-export ~/Downloads/chatgpt-export/conversations.json
 backpass --chatgpt-export ~/Downloads/chatgpt-export
+
+# Nexus Markdown archives are supported recursively too. Use --since all for a
+# point-in-time archive whose newest conversation is older than the 30d default:
+backpass scan --chatgpt-export ~/.wiki/Nexus/Conversations/chatgpt --since all --strict
+backpass --chatgpt-export ~/.wiki/Nexus/Conversations/chatgpt --since all
 ```
 
 ## How It Works
@@ -84,10 +89,11 @@ backpass --chatgpt-export ~/Downloads/chatgpt-export
 ### 1. Collect samples - which sessions belong to this repo
 
 By default backpass reads the local transcript stores of seven harnesses directly. No API,
-no upload. `--chatgpt-export <path>` instead reads an extracted ChatGPT conversation export;
-the flag is repeatable and accepts either a JSON file or a directory containing
-`conversations*.json`. Pass `--harness` as well only when you deliberately want to combine
-the import with local stores.
+no upload. `--chatgpt-export <path>` instead reads exported ChatGPT conversations; the
+flag is repeatable and accepts OpenAI `conversations*.json` files/directories or recursive
+Nexus `nexus-ai-chat-importer` Markdown archives. Pass `--harness` as well only when you
+deliberately want to combine the import with local stores. `--since` still applies to
+explicit imports; use `--since all` when you want the full point-in-time archive.
 
 | Source         | Store                                          | Repo tie                                            |
 | -------------- | ---------------------------------------------- | --------------------------------------------------- |
@@ -98,7 +104,7 @@ the import with local stores.
 | **grok**       | `~/.grok/sessions/<encoded-cwd>/<uuid>/`       | `summary.json` `cwd` + `git_remotes`                |
 | **cursor CLI** | `~/.cursor/chats/<md5(cwd)>/<uuid>/`           | `meta.json` `cwd`                                   |
 | **hermes**     | `~/.hermes/state.db` (sqlite)                  | session cwd, with CLI prompt / ACP config fallbacks |
-| **chatgpt**    | extracted `conversations*.json`                | explicit `--chatgpt-export` attachment              |
+| **chatgpt**    | OpenAI JSON or Nexus Markdown archives         | explicit `--chatgpt-export` attachment              |
 
 Claude collection covers `$CLAUDE_CONFIG_DIR/projects` alongside the default store, so a
 relocated config dir does not hide its sessions. The variable is read from backpass's own
@@ -114,12 +120,15 @@ and reads each JSONL file once.
 Hermes collection includes CLI and ACP sessions only. Gateway, cron, and WhatsApp sessions
 are excluded because their recorded cwd belongs to the shared gateway process, not a project.
 
-ChatGPT account exports do not contain a trustworthy repo cwd or git remote. That is why they
-are never auto-discovered: naming an export is the association decision. Every conversation
-in a supplied JSON file is therefore treated as in-scope for the current run. If an account-wide
-export contains unrelated chats, filter it first or pass a JSON file containing only the
-conversations you want to train from. Backpass follows each conversation's active branch and
-ignores abandoned branches. The downloaded ZIP itself is not parsed; extract it first.
+ChatGPT exports do not contain a trustworthy repo cwd or git remote. That is why they are
+never auto-discovered: naming an export is the association decision. Every conversation in a
+supplied export source is therefore treated as in-scope for the current run. If an account-wide
+export contains unrelated chats, filter it first or point Backpass at a narrower export tree.
+For OpenAI JSON, Backpass follows each conversation's active branch and ignores abandoned
+branches. Nexus Markdown is already one conversation per file; repeated exported files that
+reference the same `conversation_id` are normalized to that one conversation identity, with
+the newest/more complete snapshot preferred deterministically. The downloaded OpenAI ZIP
+itself is not parsed; extract it first.
 
 Association runs in five tiers:
 
@@ -171,10 +180,11 @@ deterministically: user and assistant turns verbatim, each tool call collapsed t
 dropped, secrets redacted. Typical reduction is **96-99%**.
 
 The distilled trace ends with the path to the raw transcript, so the analysis agent can
-open the original when - and only when - a specific claim needs it. For ChatGPT imports,
+open the original when - and only when - a specific claim needs it. For OpenAI JSON imports,
 Backpass materializes only the selected conversation's active branch under
-`.backpass/imported-transcripts/chatgpt/`; it never exposes the account-wide export as that
-raw escape hatch.
+`.backpass/imported-transcripts/chatgpt/`; it never exposes the account-wide JSON export as
+that raw escape hatch. Nexus Markdown files already contain one selected conversation, so
+the original Markdown file is the raw escape hatch.
 
 ### 3. Calculate loss - one cheap call per transcript
 

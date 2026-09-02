@@ -7,13 +7,14 @@ import { warn } from "../../logger.js";
 export const name = "chatgpt";
 
 const sourceCache = new Map();
+const NEXUS_HEAD_BYTES = 8 * 1024;
 
 export function discover({ cutoffMs = null, repo, config }) {
-  const out = [];
+  const byId = new Map();
   const inputs = config.discovery.chatgptExports || [];
 
-  for (const sourcePath of exportFiles(inputs, repo.root)) {
-    const loaded = loadSource(sourcePath);
+  for (const candidate of exportFiles(inputs, repo.root)) {
+    const loaded = loadSource(candidate.path, { warnUnrecognized: candidate.explicit });
     if (!loaded) continue;
 
     for (const conversation of loaded.conversations) {
@@ -21,34 +22,50 @@ export function discover({ cutoffMs = null, repo, config }) {
       if (!id) continue;
       const updatedAt =
         timestampMs(conversation.update_time) || timestampMs(conversation.create_time) || loaded.mtimeMs;
-      if (cutoffMs && updatedAt < cutoffMs) continue;
-
-      const rawPath = selectedRawPath(config.state?.root, id, sourcePath);
-      out.push({
+      const rawPath =
+        loaded.format === "nexus-markdown" ? candidate.path : selectedRawPath(config.state?.root, id, candidate.path);
+      const row = {
         id,
         path: rawPath,
         title: conversation.title || null,
         startedAt: timestampMs(conversation.create_time) || updatedAt,
         mtimeMs: updatedAt,
-        bytes: Buffer.byteLength(JSON.stringify(conversation), "utf8"),
+        bytes:
+          loaded.format === "nexus-markdown" ? loaded.bytes : Buffer.byteLength(JSON.stringify(conversation), "utf8"),
         model: conversationModel(conversation),
         association: {
           tier: 0,
           confidence: "explicit",
           reason: `ChatGPT export explicitly attached to ${repo.name || "this repo"}`,
         },
-        extra: { sourcePath, conversationId: id, rawPath },
-      });
+        extra: {
+          sourcePath: candidate.path,
+          sourceFormat: loaded.format,
+          conversationId: id,
+          rawPath,
+        },
+      };
+      const current = byId.get(id);
+      if (!current || preferConversation(row, current)) byId.set(id, row);
     }
   }
 
-  return out;
+  return [...byId.values()].filter((row) => !cutoffMs || row.mtimeMs >= cutoffMs);
 }
 
 export function read(ref) {
+  if (ref.extra?.sourceFormat === "nexus-markdown") return readNexusConversation(ref);
+  return readJsonConversation(ref);
+}
+
+export function rawPath(ref) {
+  return ref.extra?.rawPath || ref.path;
+}
+
+function readJsonConversation(ref) {
   const sourcePath = ref.extra?.sourcePath;
   const id = ref.extra?.conversationId || ref.nativeId || ref.id;
-  const loaded = sourcePath && loadSource(sourcePath);
+  const loaded = sourcePath && loadSource(sourcePath, { warnUnrecognized: true });
   const conversation = loaded?.conversations.find((item) => conversationId(item) === id);
   if (!conversation) {
     throw new Error(`ChatGPT conversation ${id} no longer exists in ${sourcePath || "the configured export"}`);
@@ -73,12 +90,22 @@ export function read(ref) {
   return { events, model: conversationModel(conversation, nodes) };
 }
 
-export function rawPath(ref) {
-  return ref.extra?.rawPath || ref.path;
+function readNexusConversation(ref) {
+  const sourcePath = ref.extra?.sourcePath || ref.path;
+  const id = ref.extra?.conversationId || ref.nativeId || ref.id;
+  const loaded = loadNexusSource(sourcePath, { warnUnrecognized: true });
+  const conversation = loaded?.conversations[0];
+  if (!conversation || conversationId(conversation) !== id) {
+    throw new Error(`ChatGPT conversation ${id} no longer exists in ${sourcePath || "the configured export"}`);
+  }
+
+  const text = fs.readFileSync(sourcePath, "utf8");
+  const parsed = nexusEvents(text);
+  return { events: parsed.events, model: parsed.model || conversationModel(conversation) };
 }
 
 function exportFiles(inputs, repoRoot) {
-  const out = [];
+  const found = new Map();
   for (const input of inputs) {
     const resolved = resolveInput(input, repoRoot);
     let stat;
@@ -89,31 +116,52 @@ function exportFiles(inputs, repoRoot) {
       continue;
     }
     if (stat.isFile()) {
-      out.push(resolved);
+      found.set(resolved, { path: resolved, explicit: true });
       continue;
     }
     if (!stat.isDirectory()) {
       warn(`chatgpt: export path is not a file or directory (${resolved}) - skipped`);
       continue;
     }
-    let files;
-    try {
-      files = fs
-        .readdirSync(resolved, { withFileTypes: true })
-        .filter((entry) => entry.isFile() && entry.name.startsWith("conversations") && entry.name.endsWith(".json"))
-        .map((entry) => path.join(resolved, entry.name))
-        .sort();
-    } catch (err) {
-      warn(`chatgpt: export directory unreadable (${resolved}: ${err.message}) - skipped`);
-      continue;
-    }
+
+    const files = walkExportDirectory(resolved);
     if (!files.length) {
-      warn(`chatgpt: no conversations*.json files found in ${resolved} - skipped`);
+      warn(`chatgpt: no conversations*.json or Markdown files found in ${resolved} - skipped`);
       continue;
     }
-    out.push(...files);
+    for (const file of files) {
+      if (!found.has(file)) found.set(file, { path: file, explicit: false });
+    }
   }
-  return [...new Set(out)];
+  return [...found.values()].sort((a, b) => a.path.localeCompare(b.path));
+}
+
+function walkExportDirectory(root) {
+  const files = [];
+  const stack = [root];
+  while (stack.length) {
+    const dir = stack.pop();
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch (err) {
+      warn(`chatgpt: export directory unreadable (${dir}: ${err.message}) - skipped`);
+      continue;
+    }
+    for (const entry of entries) {
+      const file = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (!entry.name.startsWith(".")) stack.push(file);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      const lower = entry.name.toLowerCase();
+      if (lower.endsWith(".md") || (lower.startsWith("conversations") && lower.endsWith(".json"))) {
+        files.push(file);
+      }
+    }
+  }
+  return files.sort();
 }
 
 function resolveInput(input, repoRoot) {
@@ -121,7 +169,12 @@ function resolveInput(input, repoRoot) {
   return path.resolve(repoRoot, expanded);
 }
 
-function loadSource(sourcePath) {
+function loadSource(sourcePath, options = {}) {
+  if (sourcePath.toLowerCase().endsWith(".md")) return loadNexusSource(sourcePath, options);
+  return loadJsonSource(sourcePath);
+}
+
+function loadJsonSource(sourcePath) {
   let stat;
   try {
     stat = fs.statSync(sourcePath);
@@ -129,7 +182,9 @@ function loadSource(sourcePath) {
     return null;
   }
   const cached = sourceCache.get(sourcePath);
-  if (cached && cached.mtimeMs === stat.mtimeMs && cached.bytes === stat.size) return cached;
+  if (cached && cached.mtimeMs === stat.mtimeMs && cached.bytes === stat.size && cached.format === "openai-json") {
+    return cached;
+  }
 
   let value;
   try {
@@ -150,9 +205,156 @@ function loadSource(sourcePath) {
     return null;
   }
 
-  const loaded = { conversations, mtimeMs: stat.mtimeMs, bytes: stat.size };
+  const loaded = { format: "openai-json", conversations, mtimeMs: stat.mtimeMs, bytes: stat.size };
   sourceCache.set(sourcePath, loaded);
   return loaded;
+}
+
+function loadNexusSource(sourcePath, { warnUnrecognized = false } = {}) {
+  let stat;
+  try {
+    stat = fs.statSync(sourcePath);
+  } catch {
+    return null;
+  }
+  let head;
+  try {
+    head = readHead(sourcePath, NEXUS_HEAD_BYTES);
+  } catch (err) {
+    if (warnUnrecognized) warn(`chatgpt: export unreadable (${sourcePath}: ${err.message}) - skipped`);
+    return null;
+  }
+  const conversation = nexusConversationHeader(head);
+  if (!conversation) {
+    if (warnUnrecognized) warn(`chatgpt: unrecognized Nexus ChatGPT Markdown export (${sourcePath}) - skipped`);
+    return null;
+  }
+
+  const loaded = {
+    format: "nexus-markdown",
+    conversations: [conversation],
+    mtimeMs: stat.mtimeMs,
+    bytes: stat.size,
+  };
+  return loaded;
+}
+
+function readHead(file, maxBytes) {
+  const fd = fs.openSync(file, "r");
+  try {
+    const stat = fs.fstatSync(fd);
+    const length = Math.min(stat.size, maxBytes);
+    const buffer = Buffer.alloc(length);
+    fs.readSync(fd, buffer, 0, length, 0);
+    return buffer.toString("utf8");
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function nexusConversationHeader(text) {
+  const match = text.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
+  if (!match) return null;
+  const frontmatter = match[1];
+  if (frontmatterValue(frontmatter, "nexus") !== "nexus-ai-chat-importer") return null;
+  if (frontmatterValue(frontmatter, "provider") !== "chatgpt") return null;
+  const id = frontmatterValue(frontmatter, "conversation_id");
+  if (!id) return null;
+
+  const titleMatch = text.slice(match[0].length).match(/^# Title:\s*(.+?)\s*$/m);
+  const models = frontmatterList(frontmatter, "models");
+  return {
+    id,
+    conversation_id: id,
+    title: frontmatterValue(frontmatter, "aliases") || titleMatch?.[1]?.trim() || null,
+    create_time: frontmatterValue(frontmatter, "create_time"),
+    update_time: frontmatterValue(frontmatter, "update_time"),
+    default_model_slug: models.at(-1) || null,
+  };
+}
+
+function frontmatterValue(frontmatter, key) {
+  const match = frontmatter.match(new RegExp(`^${escapeRegExp(key)}:\\s*(.*?)\\s*$`, "m"));
+  if (!match) return null;
+  return parseYamlScalar(match[1]);
+}
+
+function frontmatterList(frontmatter, key) {
+  const lines = frontmatter.split(/\r?\n/);
+  const start = lines.findIndex((line) => new RegExp(`^${escapeRegExp(key)}:\\s*$`).test(line));
+  if (start < 0) return [];
+  const values = [];
+  for (let i = start + 1; i < lines.length; i += 1) {
+    const match = lines[i].match(/^\s+-\s+(.+?)\s*$/);
+    if (!match) break;
+    const value = parseYamlScalar(match[1]);
+    if (value) values.push(value);
+  }
+  return values;
+}
+
+function parseYamlScalar(value) {
+  const trimmed = String(value ?? "").trim();
+  if (!trimmed) return null;
+  if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    try {
+      return JSON.parse(trimmed);
+    } catch {
+      return trimmed.slice(1, -1);
+    }
+  }
+  if (trimmed.startsWith("'") && trimmed.endsWith("'")) return trimmed.slice(1, -1).replace(/''/g, "'");
+  return trimmed;
+}
+
+function nexusEvents(text) {
+  const lines = text.split(/\r?\n/);
+  const events = [];
+  let model = null;
+  let i = 0;
+  while (i < lines.length) {
+    const marker = lines[i].match(
+      /^>\s?\[!nexus_(user|agent)\]\s+\*\*(?:User|Assistant)(?:\s+·\s+([^*]+?))?\*\*(?:\s+-.*)?$/,
+    );
+    if (!marker) {
+      i += 1;
+      continue;
+    }
+
+    const role = marker[1] === "user" ? "user" : "assistant";
+    if (role === "assistant" && marker[2]?.trim()) model = marker[2].trim();
+    const body = [];
+    i += 1;
+    while (i < lines.length && lines[i].startsWith(">")) {
+      if (/^>\s?\[!nexus_(?:user|agent)\]/.test(lines[i])) break;
+      body.push(lines[i].replace(/^>\s?/, ""));
+      i += 1;
+    }
+    const message = trimBlankLines(body).join("\n");
+    if (message) events.push({ kind: "message", role, text: message });
+  }
+  return { events, model };
+}
+
+function trimBlankLines(lines) {
+  let start = 0;
+  let end = lines.length;
+  while (start < end && !lines[start].trim()) start += 1;
+  while (end > start && !lines[end - 1].trim()) end -= 1;
+  return lines.slice(start, end);
+}
+
+function preferConversation(next, current) {
+  if (next.mtimeMs !== current.mtimeMs) return next.mtimeMs > current.mtimeMs;
+  if (next.bytes !== current.bytes) return next.bytes > current.bytes;
+  const nextPath = next.extra?.sourcePath || "";
+  const currentPath = current.extra?.sourcePath || "";
+  if (nextPath.length !== currentPath.length) return nextPath.length < currentPath.length;
+  return nextPath.localeCompare(currentPath) < 0;
+}
+
+function escapeRegExp(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function conversationId(conversation) {
