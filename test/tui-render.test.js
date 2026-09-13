@@ -87,6 +87,21 @@ test("spinner cycles through the braille frames on an 80ms cadence", () => {
 
 // ---------- event reduction ----------
 
+test("host progress preserves aliases that match prototype keys", () => {
+  const state = stateAfter([
+    ["discover:start", { harnesses: [] }],
+    ["discover:host:start", { host: "__proto__" }],
+    ["discover:host:done", { host: "__proto__", node: "v24.0.0", harnesses: { claude: { scanned: 2 } }, scanned: 2 }],
+  ]);
+
+  assert.deepEqual(state.discover.hostOrder, ["__proto__"]);
+  assert.equal(Object.hasOwn(state.discover.hosts, "__proto__"), true);
+  const prototypeHost = /** @type {{ status: string }} */ (state.discover.hosts["__proto__"]);
+  assert.equal(prototypeHost.status, "done");
+  assert.equal(/** @type {Record<string, unknown>} */ (Object.prototype).status, undefined);
+  assert.match(render(state).join("\n"), /ssh __proto__ node v24\.0\.0 · claude 2/);
+});
+
 test("discovery events accumulate per-harness rows and totals", () => {
   const state = stateAfter([
     ["discover:start", { harnesses: ["claude", "codex", "pi"] }],

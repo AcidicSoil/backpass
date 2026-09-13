@@ -1,0 +1,213 @@
+#!/usr/bin/env node
+/**
+ * A stand-in for the `ssh` binary, selected with `BACKPASS_SSH_BIN` (the same hatch
+ * `test/fixtures/fake-lavish/` uses). It makes the whole remote tier testable offline:
+ * the real option set, the real stdin program, the real loader, the real adapters and
+ * the real frame parser all run - only the network is replaced by `sh -c` against a
+ * fixture home.
+ *
+ * `BACKPASS_FAKE_SSH_MAP` names a JSON file of destination -> behaviour:
+ *   {
+ *     "mac-home": {
+ *       "home": "/tmp/...",                     the fixture HOME the command runs against
+ *       "locateOutput": "node|...",             stand in for a machine with an old, or no, Node
+ *       "fail": { "stderr": "...", "code": 255 },
+ *       "hang": true, "hangStderr": "...",      a connection that succeeds and then waits
+ *       "truncateFetch": 40                     cut the fetch stream, the way a dropped link does
+ *     }
+ *   }
+ * An unlisted destination answers the way ssh does for a name that will not resolve.
+ * `BACKPASS_FAKE_SSH_LOG` collects one JSON line per call, including the probe request's
+ * `op`, so a test can prove a second run made no fetch call at all.
+ */
+import fs from "node:fs";
+import { spawnSync } from "node:child_process";
+
+const argv = process.argv.slice(2);
+const separator = argv.indexOf("--");
+const destination = argv[separator + 1];
+const command = argv[separator + 2] || "";
+const input = fs.readFileSync(0);
+
+/** The probe request travels inside the stdin program's base64 payload, never on the command line. */
+function requestOp(program) {
+  const match = program.match(/Buffer\.from\("([A-Za-z0-9+/=]+)", "base64"\)/);
+  if (!match) return null;
+  try {
+    return JSON.parse(Buffer.from(match[1], "base64").toString("utf8")).request?.op ?? null;
+  } catch {
+    return null;
+  }
+}
+
+const requestedControlOperation = argv[argv.indexOf("-O") + 1];
+const controlOperation = argv.includes("-M")
+  ? "master:start"
+  : requestedControlOperation === "exit"
+    ? "master:stop"
+    : requestedControlOperation === "check"
+      ? "master:check"
+      : null;
+const op = controlOperation || requestOp(input.toString("utf8"));
+const options = argv.slice(0, separator);
+const option = (name) => options.find((value) => value.startsWith(`${name}=`))?.slice(name.length + 1);
+const socket = option("ControlPath")?.replace("%C", Buffer.from(destination).toString("hex"));
+
+const log = process.env.BACKPASS_FAKE_SSH_LOG;
+if (log && op !== "master:check") {
+  fs.appendFileSync(log, `${JSON.stringify({ destination, op, options })}\n`);
+}
+
+const map = JSON.parse(fs.readFileSync(process.env.BACKPASS_FAKE_SSH_MAP, "utf8"));
+const host = map[destination];
+
+if (!host) {
+  process.stderr.write(`ssh: Could not resolve hostname ${destination}: nodename nor servname provided\n`);
+  process.exit(255);
+}
+if (op === "master:start" && host.masterFail) {
+  process.stderr.write(`${host.masterFail.stderr}\n`);
+  process.exit(host.masterFail.code ?? 255);
+}
+if (host.fail) {
+  process.stderr.write(`${host.fail.stderr}\n`);
+  process.exit(host.fail.code ?? 255);
+}
+if (op === "master:start") {
+  fs.writeFileSync(socket, JSON.stringify({ startedAt: Date.now(), persist: option("ControlPersist"), pid: process.pid }));
+  const wait = setInterval(() => {
+    if (!fs.existsSync(socket)) {
+      clearInterval(wait);
+      process.exit(0);
+    }
+  }, 10);
+  const stop = () => {
+    fs.rmSync(socket, { force: true });
+    process.exit(0);
+  };
+  process.on("SIGINT", stop);
+  process.on("SIGTERM", stop);
+} else if (op === "master:check") {
+  try {
+    const master = JSON.parse(fs.readFileSync(socket, "utf8"));
+    process.kill(master.pid, 0);
+    process.exit(0);
+  } catch {
+    process.exit(255);
+  }
+} else if (op === "master:stop") {
+  fs.rmSync(socket, { force: true });
+  if (host.masterStopFail) {
+    process.stderr.write(`${host.masterStopFail.stderr}\n`);
+    process.exit(host.masterStopFail.code ?? 255);
+  }
+  process.exit(0);
+}
+if (op !== "master:start") {
+  if (!controlOperation && host.enforceMaster) {
+    let master;
+    try {
+      master = JSON.parse(fs.readFileSync(socket, "utf8"));
+    } catch {
+      process.stderr.write("control master unavailable\n");
+      process.exit(255);
+    }
+    if (master.persist !== "yes" && Date.now() - master.startedAt > Number(master.persist)) {
+      fs.rmSync(socket, { force: true });
+      process.stderr.write("control master expired\n");
+      process.exit(255);
+    }
+  }
+  if (host.hang) {
+    if (host.hangStderr) process.stderr.write(`${host.hangStderr}\n`);
+    setTimeout(() => process.exit(0), 600_000);
+  } else {
+    runCommand();
+  }
+}
+
+function fetchFrameSpans(output) {
+  const spans = [];
+  let offset = 0;
+  while (offset < output.length) {
+    const newline = output.indexOf(0x0a, offset);
+    if (newline === -1) break;
+    const header = JSON.parse(output.subarray(offset, newline).toString("utf8"));
+    if (header.end === true) break;
+    const end = newline + 1 + header.bytes;
+    spans.push({ start: offset, headerEnd: newline + 1, end });
+    offset = end;
+  }
+  return spans;
+}
+
+function runCommand() {
+  // The locate call may be answered from the fixture (to stand in for a machine with an
+  // old Node, no Node, or no git) or run for real, which is what keeps the shipped POSIX
+  // snippet honest.
+  if (op === null && host.locateOutput !== undefined) {
+    process.stdout.write(host.locateOutput ? `${host.locateOutput}\n` : "");
+    process.exit(0);
+  }
+  if (op === "discover" && host.discoverOutput !== undefined) {
+    process.stdout.write(`${host.discoverOutput}\n`);
+    process.exit(0);
+  }
+
+  const env = { ...process.env, HOME: host.home, USERPROFILE: host.home };
+  if (host.nodeOptions) env.NODE_OPTIONS = host.nodeOptions;
+  for (const key of ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "HERMES_HOME", "XDG_CONFIG_HOME"]) delete env[key];
+  const result = spawnSync("sh", ["-c", command], {
+    env,
+    cwd: host.home,
+    stdio: ["pipe", "pipe", "inherit"],
+    input,
+    maxBuffer: 256 * 1024 * 1024,
+  });
+
+  const out = result.stdout ?? Buffer.alloc(0);
+  const truncate = op === "fetch" && host.truncateFetch != null;
+  let emitted =
+    op === "fetch" && host.fetchOutput !== undefined
+      ? Buffer.from(host.fetchOutput, "base64")
+      : truncate
+        ? out.subarray(0, host.truncateFetch)
+        : out;
+  if (op === "fetch" && host.omitFetchFrame != null) {
+    const span = fetchFrameSpans(emitted)[host.omitFetchFrame - 1];
+    if (span) emitted = Buffer.concat([emitted.subarray(0, span.start), emitted.subarray(span.end)]);
+  }
+  if (op === "fetch" && host.truncateFetchFrame != null) {
+    const span = fetchFrameSpans(emitted)[host.truncateFetchFrame - 1];
+    if (span) emitted = emitted.subarray(0, span.headerEnd + Math.floor((span.end - span.headerEnd) / 2));
+  }
+  if (op === "fetch" && host.truncateFetchHeader != null) {
+    const span = fetchFrameSpans(emitted)[host.truncateFetchHeader - 1];
+    if (span) {
+      const header = emitted.subarray(span.start, span.headerEnd - 1);
+      const identityEnd = header.indexOf(Buffer.from(',"kind"'));
+      const kept = identityEnd === -1 ? Math.max(1, Math.floor(header.length / 2)) : identityEnd + 3;
+      emitted = emitted.subarray(0, span.start + kept);
+    }
+  }
+  if (op === "fetch" && host.truncateFetchHeaderMidUnicode != null) {
+    const span = fetchFrameSpans(emitted)[host.truncateFetchHeaderMidUnicode - 1];
+    if (span) {
+      const header = emitted.subarray(span.start, span.headerEnd - 1);
+      const multibyte = header.findIndex((byte) => byte >= 0x80);
+      if (multibyte !== -1) emitted = emitted.subarray(0, span.start + multibyte + 1);
+    }
+  }
+  if (op === "fetch" && host.truncateEndFrame) {
+    const terminator = Buffer.from('{"end":true}\n');
+    const end = emitted.lastIndexOf(terminator);
+    if (end !== -1) emitted = emitted.subarray(0, end + Math.floor(terminator.length / 2));
+  }
+  if (op === "fetch" && host.omitEndFrame) {
+    const terminator = Buffer.from('{"end":true}\n');
+    const end = emitted.lastIndexOf(terminator);
+    if (end !== -1) emitted = emitted.subarray(0, end);
+  }
+  fs.writeSync(1, emitted);
+  process.exit(op === "fetch" && host.fetchExitCode != null ? host.fetchExitCode : result.status === null ? 255 : result.status);
+}

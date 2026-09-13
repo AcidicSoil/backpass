@@ -20,13 +20,24 @@ import path from "node:path";
  * @param {string[]} args
  * @param {{ timeoutMs?: number, cwd?: string, input?: string, env?: NodeJS.ProcessEnv,
  *   platform?: NodeJS.Platform, lookupEnv?: NodeJS.ProcessEnv,
+ *   captureStdout?: boolean, onStdout?: (chunk: Buffer) => void,
  *   spawnFn?: (file: string, args: string[], options: object) => any }} [options]
  * @returns {Promise<{ code: number | null, stdout: string, stderr: string, timedOut?: boolean, spawnError?: ShimError }>}
  */
 export function runCapture(
   bin,
   args,
-  { timeoutMs, cwd, input, env, platform = process.platform, lookupEnv = process.env, spawnFn = spawn } = {},
+  {
+    timeoutMs,
+    cwd,
+    input,
+    env,
+    platform = process.platform,
+    lookupEnv = process.env,
+    spawnFn = spawn,
+    captureStdout = true,
+    onStdout = null,
+  } = {},
 ) {
   return new Promise((resolve) => {
     const launch = windowsShimLaunch(bin, args, { platform, env: lookupEnv });
@@ -68,7 +79,9 @@ export function runCapture(
       : null;
 
     child.stdout.on("data", (d) => {
-      stdout += d;
+      const chunk = Buffer.isBuffer(d) ? d : Buffer.from(d);
+      if (onStdout) onStdout(chunk);
+      if (captureStdout) stdout += d;
     });
     child.stderr.on("data", (d) => {
       stderr += d;
