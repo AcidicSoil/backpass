@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.23](https://github.com/kunchenguid/backpass/compare/backpass-v0.1.22...backpass-v0.1.23) (2026-09-16)
+
+
+### Bug Fixes
+
+* **acpx:** stop discarding stderr on empty-output classification ([#131](https://github.com/kunchenguid/backpass/issues/131)) ([4f5a684](https://github.com/kunchenguid/backpass/commit/4f5a684a4f3130ab5676b1ba26ec9928eca92287))
+* **apply:** compare skillsDir by resolved logical path and drop placeholder failure locations ([#133](https://github.com/kunchenguid/backpass/issues/133)) ([dc4124d](https://github.com/kunchenguid/backpass/commit/dc4124d342d18a4ea523483eb3bdd7d0c693424c))
+* **synthesize:** count stray edit-turn writes as touched ([#132](https://github.com/kunchenguid/backpass/issues/132)) ([dbaeced](https://github.com/kunchenguid/backpass/commit/dbaeced54538bb5bdd8e27c59f5eb8307e4f1109))
+
 ## [0.1.22](https://github.com/kunchenguid/backpass/compare/backpass-v0.1.21...backpass-v0.1.22) (2026-09-13)
 
 
