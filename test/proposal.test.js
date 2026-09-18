@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import vm from "node:vm";
 
@@ -15,12 +16,14 @@ import {
 } from "../src/proposal.js";
 import { foldEvidence, renderEvidenceForPrompt, renderEvidenceReport } from "../src/fold.js";
 import { estimateTokens } from "../src/tokens.js";
+import { loadProjectSkills, skillDescriptionTokens } from "../src/skills.js";
 import { parseMemoryUnits } from "../src/memory.js";
 import { isSuppressedByRejection, recordRejection, State } from "../src/state.js";
 import { applyDecisions } from "../src/apply/writer.js";
 import { injectPayload, parseDecisions, renderApplySurface } from "../src/apply/lavish.js";
 import { renderEdit } from "../src/apply/terminal.js";
 import { extractJson, parseTokenLine, stripAcpxNoise } from "../src/acpx.js";
+import { STRAY_OUTSIDE_REPO, STRAY_OUTSIDE_SURFACE, STRAY_UNWRITABLE, strayAliasReason } from "../src/workspace.js";
 import { makeRepo, stageAndMeasure, writeIn } from "./helpers/staging.js";
 
 const MEMORY_TEXT = [
@@ -34,7 +37,13 @@ const MEMORY_TEXT = [
   "",
 ].join("\n");
 
-const QUOTE = [{ polarity: "negative", text: "it used a bare #2731 reference", source: "claude · abc · turn 3" }];
+// Two sources, because every edit that changes the always-loaded surface now clears the
+// session floor. Tests whose subject is that floor pass their own evidence.
+const QUOTE = [
+  { polarity: "negative", text: "it used a bare #2731 reference", source: "claude · abc · turn 3" },
+  { polarity: "negative", text: "the PR was named without a link", source: "codex · def · turn 8" },
+];
+const ONE_SESSION = [QUOTE[0]];
 
 function config(overrides = {}) {
   return {
@@ -82,13 +91,27 @@ function gate({ text = MEMORY_TEXT, files = {}, edit, annotation, config: cfg = 
   return { ...result, ...staged, repo };
 }
 
+/** Every instruction corroborated by enough harm-class sessions to clear the floors. */
+const aliasSummary = () => ({
+  analyzedSessions: 4,
+  totals: { positive: 3, negative: 2, gapClusters: 1 },
+  instructions: Array.from({ length: 20 }, (_, i) => ({
+    instruction: `AG-${String(i + 1).padStart(3, "0")}`,
+    positive: 0,
+    negative: 4,
+    harmSessions: 4,
+    sessions: 4,
+    relevance: 1,
+    quotes: [],
+  })),
+});
+
 const memoryEdit = (fn) => (root) => writeIn(root, "AGENTS.md", fn);
 const claim = (changes, extra = {}) => ({
   changes,
   kind: "rewrite",
   title: "t",
   evidence: QUOTE,
-  transcripts: 3,
   ...extra,
 });
 
@@ -242,22 +265,14 @@ test("folded domain votes separate synthesis evidence from report-only diagnosti
     );
   const propose = (summary, minGapEvidence) => {
     const displayed = summary.gaps[0] || summary.reportOnlyGaps[0];
-    const evidence = displayed.quotes.slice(0, 1).map((quote) => ({
+    const evidence = displayed.quotes.slice(0, minGapEvidence).map((quote) => ({
       polarity: "negative",
       text: quote.text,
       source: quote.source,
     }));
     return gate({
       edit: memoryEdit((text) => `${text}- ${phrasing}\n`),
-      annotation: {
-        edits: [
-          claim(["H1"], {
-            kind: "add",
-            evidence,
-            transcripts: Math.max(displayed.sessions, minGapEvidence),
-          }),
-        ],
-      },
+      annotation: { edits: [claim(["H1"], { kind: "add", evidence })] },
       config: config({ minGapEvidence }),
       context: { summary },
     });
@@ -296,11 +311,530 @@ test("a new instruction backed by too few sessions is rejected, whatever kind th
   for (const kind of ["add", "rewrite"]) {
     const { proposal, violations } = gate({
       edit: insert,
-      annotation: { edits: [claim(["H1"], { kind, title: "new rule from one session", transcripts: 1 })] },
+      annotation: { edits: [claim(["H1"], { kind, title: "new rule from one session", evidence: ONE_SESSION })] },
     });
     assert.equal(proposal.edits.length, 0, `${kind}: measured as an addition`);
     assert.ok(violations.some((v) => /backed by 1 session/.test(v)));
   }
+});
+
+// The always-loaded session floor. Its whole point is that it asks nothing of the text:
+// a rewrite is not classified as "really an addition" or "really a tightening" - the
+// only question is how many distinct sessions the edit's own quotes come from. The
+// shapes below are the ones that broke every lexical proxy tried before it.
+const REWRITE_SHAPES = {
+  "append a sentence": (t) =>
+    t.replace(
+      "- Whenever a PR is mentioned, include its URL.",
+      "- Whenever a PR is mentioned, include its URL. Check for and replace every bare number.",
+    ),
+  "append four tokens": (t) => t.replace("- Prefer small commits.", "- Prefer small commits. Same for PRs."),
+  "pure tightening, shared words": (t) =>
+    t.replace("- Use Node 18 via nvm before running any script.", "- Use Node 18 with nvm."),
+  "paraphrase tightening, few shared words": (t) =>
+    t.replace("- Use Node 18 via nvm before running any script.", "- Run every script under nvm's Node 18."),
+  negation: (t) => t.replace("- Prefer small commits.", "- Never prefer small commits."),
+  "version bump": (t) => t.replace("Node 18", "Node 22"),
+  "unrelated net-negative substitution": (t) =>
+    t.replace("- Use Node 18 via nvm before running any script.", "- Route SSH through the bastion."),
+  "split one rule into two bullets": (t) =>
+    t.replace(
+      "- Use Node 18 via nvm before running any script.",
+      "- Use Node 18 via nvm.\n- Do it before running any script.",
+    ),
+  "reword and extend": (t) =>
+    t.replace("- Prefer small commits.", "- Keep commits small and focused, and squash fixups before review."),
+  "append plus an innocent word fix in the same line": (t) =>
+    t.replace(
+      "- Whenever a PR is mentioned, include its URL.",
+      "- Whenever a PR is mentioned, include its full URL. Check for and replace every bare number.",
+    ),
+};
+
+test("a single-session rewrite is refused whatever shape it takes, and the model's own session count is ignored", () => {
+  for (const [name, rewrite] of Object.entries(REWRITE_SHAPES)) {
+    const { proposal, violations } = gate({
+      edit: memoryEdit(rewrite),
+      annotation: {
+        edits: [
+          // 20 declared sessions over one quoted source: the declared number is not read.
+          claim(["H1"], { kind: "rewrite", title: name, evidence: ONE_SESSION, transcripts: 20 }),
+        ],
+      },
+    });
+    assert.equal(proposal.edits.length, 0, `${name} was accepted on one session`);
+    assert.ok(
+      violations.some((v) => /changes AGENTS\.md backed by 1 session\(s\); 2 are required/.test(v)),
+      `${name}: ${violations.join("\n")}`,
+    );
+  }
+});
+
+test("empty evidence cannot pad a single-session rewrite", () => {
+  const { proposal, violations } = gate({
+    edit: memoryEdit(REWRITE_SHAPES["append a sentence"]),
+    annotation: {
+      edits: [
+        claim(["H1"], {
+          kind: "rewrite",
+          evidence: [...ONE_SESSION, { polarity: "negative", text: "  ", source: "fake-session" }],
+        }),
+      ],
+    },
+  });
+  assert.equal(proposal.edits.length, 0);
+  assert.ok(
+    violations.some((v) => /backed by 1 session/.test(v)),
+    violations.join("\n"),
+  );
+});
+
+test("sourceless evidence cannot pad a single-session rewrite and remains visible", () => {
+  for (const source of [undefined, "", "   "]) {
+    const sourceless = { polarity: "negative", text: "another quote", ...(source === undefined ? {} : { source }) };
+    const { proposal, violations } = gate({
+      edit: memoryEdit(REWRITE_SHAPES["append a sentence"]),
+      annotation: {
+        edits: [claim(["H1"], { kind: "rewrite", evidence: [...ONE_SESSION, sourceless] })],
+      },
+    });
+    assert.equal(proposal.edits.length, 0);
+    assert.ok(
+      violations.some((v) => /backed by 1 session/.test(v)),
+      violations.join("\n"),
+    );
+  }
+
+  const { proposal, violations } = gate({
+    edit: memoryEdit(REWRITE_SHAPES["append a sentence"]),
+    annotation: {
+      edits: [
+        claim(["H1"], {
+          kind: "rewrite",
+          evidence: [...QUOTE, { polarity: "negative", text: "visible quote" }],
+        }),
+      ],
+    },
+  });
+  assert.deepEqual(violations, []);
+  assert.equal(proposal.edits[0].transcripts, 2);
+  assert.deepEqual(
+    proposal.edits[0].evidence.find((item) => item.text === "visible quote"),
+    { polarity: "negative", text: "visible quote", source: "unknown source" },
+  );
+});
+
+test("source-label whitespace cannot pad a single-session rewrite", () => {
+  const repeated = { ...ONE_SESSION[0], source: "claude  ·  abc · turn 3" };
+  const { proposal, violations } = gate({
+    edit: memoryEdit(REWRITE_SHAPES["append a sentence"]),
+    annotation: {
+      edits: [claim(["H1"], { kind: "rewrite", evidence: [...ONE_SESSION, repeated] })],
+    },
+  });
+  assert.equal(proposal.edits.length, 0);
+  assert.ok(
+    violations.some((v) => /backed by 1 session/.test(v)),
+    violations.join("\n"),
+  );
+});
+
+test("a rewrite spread over two hunks cannot pay for itself with one session", () => {
+  const { proposal, violations } = gate({
+    edit: memoryEdit((t) =>
+      t
+        .replace("- Use Node 18 via nvm before running any script.", "- Use Node 18 with nvm.")
+        .replace(
+          "- Whenever a PR is mentioned, include its URL.",
+          "- Whenever a PR is mentioned, include its URL. Always.",
+        ),
+    ),
+    annotation: { edits: [claim(["H1", "H2"], { kind: "rewrite", title: "two hunks", evidence: ONE_SESSION })] },
+  });
+  assert.equal(proposal.edits.length, 0);
+  assert.ok(
+    violations.some((v) => /backed by 1 session/.test(v)),
+    violations.join("\n"),
+  );
+});
+
+test("two quoted sessions carry a rewrite of any shape, including a pure tightening", () => {
+  for (const [name, rewrite] of Object.entries(REWRITE_SHAPES)) {
+    const { proposal, violations } = gate({
+      edit: memoryEdit(rewrite),
+      // `claim` quotes two sources; `transcripts` is deliberately absent from the annotation.
+      annotation: { edits: [claim(["H1"], { kind: "rewrite", title: name })] },
+    });
+    assert.deepEqual(violations, [], `${name}: ${violations.join("\n")}`);
+    assert.equal(proposal.edits.length, 1, name);
+    assert.equal(proposal.edits[0].transcripts, 2, `${name}: the count is measured from the quotes`);
+  }
+});
+
+test("the dry run's three appends still pass on their real quote-source counts", () => {
+  // e1 to e3 of the user-scope dry run: 1-removed/1-added appends backed by 3, 2 and 2
+  // distinct sources, over models that declared 11, 20 and 2.
+  const source = (n) => ({ polarity: "negative", text: `quote ${n}`, source: `claude · s${n} · 2026-08-0${n}` });
+  const appends = [
+    {
+      name: "e1 em dash",
+      sources: 3,
+      declared: 11,
+      edit: (t) =>
+        t.replace(
+          "include its URL.",
+          "include its URL. Before sending prose, check for and replace every bare reference.",
+        ),
+    },
+    {
+      name: "e2 repro before fix",
+      sources: 2,
+      declared: 20,
+      edit: (t) =>
+        t.replace(
+          "- Prefer small commits.",
+          "- Prefer small commits. Reproduce before implementing the fix, then repeat the same check after.",
+        ),
+    },
+    {
+      name: "e3 lint warnings",
+      sources: 2,
+      declared: 2,
+      edit: (t) =>
+        t.replace(
+          "before running any script.",
+          "before running any script. Treat warnings as issues rather than dismissing them.",
+        ),
+    },
+  ];
+  for (const append of appends) {
+    const evidence = Array.from({ length: append.sources }, (_, i) => source(i + 1));
+    const { proposal, violations } = gate({
+      edit: memoryEdit(append.edit),
+      annotation: {
+        edits: [claim(["H1"], { kind: "rewrite", title: append.name, evidence, transcripts: append.declared })],
+      },
+    });
+    assert.deepEqual(violations, [], `${append.name}: ${violations.join("\n")}`);
+    assert.equal(proposal.edits[0].transcripts, append.sources, append.name);
+  }
+});
+
+test("a quote counts as a session only when the fold issued its source label", () => {
+  const foldRecord = (id, day, quote) => ({
+    status: "ok",
+    transcript: { id, harness: "claude", startedAt: Date.parse(`2026-08-${day}T00:00:00Z`) },
+    positive: [],
+    negative: [{ instruction: "AG-001", quote, effect: "the rule was skipped", class: "non-compliance" }],
+    gaps: [],
+  });
+  const summary = foldEvidence(
+    [foldRecord("b859b8f3deadbeef", "18", "real quote"), foldRecord("c0ffee00deadbeef", "19", "other quote")],
+    { memoryFile: { units: parseMemoryUnits(MEMORY_TEXT) }, minGapEvidence: 2 },
+  );
+  const issued = summary.sources.find((label) => label.includes("b859b8f3"));
+  assert.ok(issued, "the fold must issue a source for the cited session");
+  const mistypedDate = issued.replace("2026-08-18", "2026-08-17");
+  assert.notEqual(mistypedDate, issued);
+  assert.equal(summary.sources.includes(mistypedDate), false);
+
+  const rewrite = memoryEdit(REWRITE_SHAPES["append a sentence"]);
+  const typo = gate({
+    edit: rewrite,
+    annotation: {
+      edits: [
+        claim(["H1"], {
+          kind: "rewrite",
+          title: "one session under two labels",
+          evidence: [
+            { polarity: "negative", text: "real quote", source: issued },
+            { polarity: "negative", text: "same session, wrong date", source: mistypedDate },
+          ],
+        }),
+      ],
+    },
+    context: { summary },
+  });
+  assert.equal(typo.proposal.edits.length, 0);
+  assert.ok(
+    typo.violations.some((v) => /backed by 1 session\(s\); 2 are required/.test(v)),
+    typo.violations.join("\n"),
+  );
+
+  const twoIssued = gate({
+    edit: rewrite,
+    annotation: {
+      edits: [
+        claim(["H1"], {
+          kind: "rewrite",
+          title: "two fold-issued sessions",
+          evidence: summary.sources.map((source, i) => ({
+            polarity: "negative",
+            text: `quote ${i}`,
+            source,
+          })),
+        }),
+      ],
+    },
+    context: { summary },
+  });
+  assert.deepEqual(twoIssued.violations, [], twoIssued.violations.join("\n"));
+  assert.equal(twoIssued.proposal.edits[0].transcripts, 2);
+
+  const unissued = gate({
+    edit: rewrite,
+    annotation: {
+      edits: [claim(["H1"], { kind: "rewrite", title: "label the fold never issued", evidence: ONE_SESSION })],
+    },
+    context: { summary },
+  });
+  assert.equal(unissued.proposal.edits.length, 0);
+  assert.ok(
+    unissued.violations.some((v) => /backed by 0 session\(s\); 2 are required/.test(v)),
+    unissued.violations.join("\n"),
+  );
+});
+
+test("on the r1 dry-run corpus, only the edit whose second source was never issued is refused", () => {
+  const foldRecord = (id, day, quote) => ({
+    status: "ok",
+    transcript: { id, harness: "claude", startedAt: Date.parse(`2026-08-${day}T00:00:00Z`) },
+    positive: [],
+    negative: [{ instruction: "AG-001", quote, effect: "the rule was skipped", class: "non-compliance" }],
+    gaps: [],
+  });
+  const summary = foldEvidence(
+    [
+      foldRecord("sess0001", "01", "e1a"),
+      foldRecord("sess0002", "02", "e1b"),
+      foldRecord("sess0003", "03", "e1c"),
+      foldRecord("sess0004", "04", "e4b"),
+    ],
+    { memoryFile: { units: parseMemoryUnits(MEMORY_TEXT) }, minGapEvidence: 2 },
+  );
+  const [s1, s2, s3, s4] = summary.sources;
+  const phantom = s1.replace(/2026-08-01/, "2026-08-17");
+  assert.equal(summary.sources.includes(phantom), false);
+
+  const cases = [
+    {
+      name: "e1 em dash",
+      expect: "pass",
+      kind: "rewrite",
+      sources: [s1, s2, s3],
+      edit: (t) =>
+        t.replace(
+          "include its URL.",
+          "include its URL. Before sending prose, check for and replace every bare reference.",
+        ),
+    },
+    {
+      name: "e2 repro before fix",
+      expect: "pass",
+      kind: "rewrite",
+      sources: [s1, s2],
+      edit: (t) =>
+        t.replace(
+          "- Prefer small commits.",
+          "- Prefer small commits. Reproduce before implementing the fix, then repeat the same check after.",
+        ),
+    },
+    {
+      name: "e3 lint warnings",
+      expect: "refuse",
+      kind: "rewrite",
+      sources: [s1, phantom],
+      edit: (t) =>
+        t.replace(
+          "before running any script.",
+          "before running any script. Treat warnings as issues rather than dismissing them.",
+        ),
+    },
+    {
+      name: "e4 current_head skill",
+      expect: "pass",
+      kind: "add",
+      sources: [s2, s4],
+      edit: (t) =>
+        t.replace(
+          "- Prefer small commits.",
+          "- Prefer small commits.\n- Prefer the current branch head when naming git state.",
+        ),
+    },
+  ];
+
+  for (const item of cases) {
+    const evidence = item.sources.map((source, i) => ({
+      polarity: "negative",
+      text: `${item.name} quote ${i}`,
+      source,
+    }));
+    const { proposal, violations } = gate({
+      edit: memoryEdit(item.edit),
+      annotation: {
+        edits: [claim(["H1"], { kind: item.kind, title: item.name, evidence, transcripts: 20 })],
+      },
+      context: { summary },
+    });
+    if (item.expect === "pass") {
+      assert.deepEqual(violations, [], `${item.name}: ${violations.join("\n")}`);
+      assert.equal(proposal.edits.length, 1, item.name);
+      assert.equal(proposal.edits[0].transcripts, item.sources.length, item.name);
+    } else {
+      assert.equal(proposal.edits.length, 0, `${item.name} was accepted`);
+      assert.ok(
+        violations.some((v) => /backed by 1 session\(s\); 2 are required/.test(v)),
+        `${item.name}: ${violations.join("\n")}`,
+      );
+    }
+  }
+});
+
+test("extract and move stay exempt from the session floor: they keep every always-loaded line", () => {
+  const extracted = "- Use Node 18 via nvm before running any script.";
+  const extract = gate({
+    edit: (root) => {
+      writeIn(root, "AGENTS.md", (t) => t.replace(`${extracted}\n`, ""));
+      writeIn(
+        root,
+        ".agents/skills/setup/SKILL.md",
+        `---\nname: setup\ndescription: setting up the toolchain\n---\n\n${extracted}\n`,
+      );
+    },
+    annotation: { edits: [claim(["H1", "H2"], { kind: "extract", title: "extract setup", evidence: ONE_SESSION })] },
+  });
+  assert.deepEqual(extract.violations, [], extract.violations.join("\n"));
+
+  const moved = gate({
+    text: `${MEMORY_TEXT}\n## Later\n\n- Keep this nearby.\n`,
+    edit: memoryEdit((t) =>
+      t.replace(`${extracted}\n`, "").replace("- Keep this nearby.", `${extracted}\n- Keep this nearby.`),
+    ),
+    annotation: { edits: [claim(["H1", "H2"], { kind: "move", title: "reposition setup", evidence: ONE_SESSION })] },
+  });
+  assert.deepEqual(moved.violations, [], moved.violations.join("\n"));
+});
+
+test("the user-scope project floor counts instruction evidence, not only gap quotes", () => {
+  // A rewrite reinforcing an existing instruction quotes instruction-row evidence, which
+  // carries no project of its own. The fold hands the gate the session -> project map so
+  // those quotes still answer the "how many projects" question.
+  const record = (id, project) => ({
+    status: "ok",
+    transcript: { id, harness: "claude", project, startedAt: Date.parse("2026-08-01T00:00:00Z") },
+    positive: [],
+    negative: [
+      { instruction: "AG-001", quote: `quote from ${id}`, effect: "the URL was omitted", class: "non-compliance" },
+    ],
+    gaps: [],
+  });
+  const foldFor = (projects) =>
+    foldEvidence(
+      projects.map((project, i) => record(`s${i + 1}`, project)),
+      { minGapEvidence: 2 },
+    );
+
+  const rewrite = memoryEdit((t) => t.replace("include its URL.", "include its full https:// URL."));
+  const proposeWith = (summary, minGapProjects, varySourceWhitespace = false) => {
+    const evidence = summary.instructions[0].quotes.map((quote, index) => ({
+      polarity: "negative",
+      text: quote.text,
+      source: varySourceWhitespace
+        ? index === 0
+          ? `  ${quote.source}  `
+          : quote.source.replaceAll(" · ", "  ·   ")
+        : quote.source,
+    }));
+    return gate({
+      edit: rewrite,
+      annotation: { edits: [claim(["H1"], { kind: "rewrite", title: "spell out the URL", evidence })] },
+      config: config({ minGapProjects }),
+      context: { summary, scope: { kind: "user" } },
+    });
+  };
+
+  const oneProject = proposeWith(foldFor(["repo-a", "repo-a"]), 2);
+  assert.ok(
+    oneProject.violations.some((v) => /evidence from 1 project\(s\); 2 are required/.test(v)),
+    oneProject.violations.join("\n"),
+  );
+
+  const twoProjects = proposeWith(foldFor(["repo-a", "repo-b"]), 2, true);
+  assert.deepEqual(twoProjects.violations, [], twoProjects.violations.join("\n"));
+  assert.equal(twoProjects.proposal.edits[0].projects, 2);
+
+  // Same evidence in a project-scoped run: no project gate at all. Quote the fold's
+  // own labels; a project-scoped fold still issues `sources` even when sourceProjects is empty.
+  const projectSummary = foldFor(["repo-a", "repo-a"]);
+  const projectScope = gate({
+    edit: rewrite,
+    annotation: {
+      edits: [
+        claim(["H1"], {
+          kind: "rewrite",
+          title: "spell out the URL",
+          evidence: projectSummary.instructions[0].quotes.map((quote) => ({
+            polarity: "negative",
+            text: quote.text,
+            source: quote.source,
+          })),
+        }),
+      ],
+    },
+    config: config({ minGapProjects: 2 }),
+    context: { summary: projectSummary, scope: { kind: "project" } },
+  });
+  assert.deepEqual(projectScope.violations, [], projectScope.violations.join("\n"));
+});
+
+test("same-day Codex ULID prefix collisions still clear the two-session rewrite floor", () => {
+  const startedAt = Date.parse("2026-09-03T00:01:00Z");
+  const a = "01K4M0NDEKTSV4RRFFQ69G5FAV";
+  const b = "01K4M0NDZZABCDEFGHJKMNPQRS";
+  const record = (nativeId, project) => ({
+    status: "ok",
+    transcript: {
+      id: `codex-${nativeId}`,
+      nativeId,
+      identity: `identity-${nativeId}`,
+      harness: "codex",
+      project,
+      startedAt,
+    },
+    positive: [],
+    negative: [
+      {
+        instruction: "AG-001",
+        quote: `quote from ${nativeId}`,
+        effect: "the URL was omitted",
+        class: "non-compliance",
+      },
+    ],
+    gaps: [],
+  });
+  const summary = foldEvidence([record(a, "repo-a"), record(b, "repo-b")], {
+    memoryFile: { units: parseMemoryUnits(MEMORY_TEXT) },
+    minGapEvidence: 2,
+  });
+  const truncated = `codex · ${a.slice(0, 8)} · 2026-09-03`;
+  assert.equal(summary.sources.includes(truncated), false);
+  assert.equal(Object.keys(summary.sourceProjects).length, 2);
+  assert.deepEqual(new Set(Object.values(summary.sourceProjects)), new Set(["repo-a", "repo-b"]));
+
+  const evidence = summary.instructions[0].quotes.map((quote) => ({
+    polarity: "negative",
+    text: quote.text,
+    source: quote.source,
+  }));
+  const { proposal, violations } = gate({
+    edit: memoryEdit((t) => t.replace("include its URL.", "include its full https:// URL.")),
+    annotation: { edits: [claim(["H1"], { kind: "rewrite", title: "spell out the URL", evidence })] },
+    config: config({ minGapProjects: 2 }),
+    context: { summary, scope: { kind: "user" } },
+  });
+  assert.deepEqual(violations, [], violations.join("\n"));
+  assert.equal(proposal.edits[0].transcripts, 2);
+  assert.equal(proposal.edits[0].projects, 2);
 });
 
 test("an edit with no verbatim quote is rejected", () => {
@@ -364,8 +898,10 @@ test("the proposal carries the fold's gap-funnel counts for the apply surface", 
           gapSightings: 9,
           gapClusters: 0,
           reportOnlyGapClusters: 2,
+          reportOnlyByReason: { majorityOrchestration: 1, belowFloorMixed: 1, tooFewProjects: 0 },
           droppedGapSingletons: 3,
           orchestrationGapSightings: 6,
+          instructionsWithNegatives: 3,
         },
         instructions: Array.from({ length: 20 }, (_, i) => ({
           instruction: `AG-${String(i + 1).padStart(3, "0")}`,
@@ -377,15 +913,158 @@ test("the proposal carries the fold's gap-funnel counts for the apply surface", 
   assert.equal(funneled.proposal.stats.gapSightings, 9);
   assert.equal(funneled.proposal.stats.orchestrationGapSightings, 6);
   assert.equal(funneled.proposal.stats.reportOnlyGapClusters, 2);
+  assert.deepEqual(funneled.proposal.stats.reportOnlyByReason, {
+    majorityOrchestration: 1,
+    belowFloorMixed: 1,
+    tooFewProjects: 0,
+  });
   assert.equal(funneled.proposal.stats.droppedGapSingletons, 3);
   assert.equal(funneled.proposal.stats.gapClusters, 0);
+  assert.equal(funneled.proposal.stats.instructionsWithNegatives, 3);
 
   // A summary from before the counts existed yields null, never an invented zero.
-  const legacy = gate({ edit, annotation });
+  const legacy = gate({
+    edit,
+    annotation,
+    context: {
+      summary: {
+        analyzedSessions: 4,
+        totals: { positive: 3, negative: 2, gapClusters: 1 },
+        instructions: Array.from({ length: 20 }, (_, i) => ({
+          instruction: `AG-${String(i + 1).padStart(3, "0")}`,
+          negative: 4,
+          harmSessions: 4,
+          sessions: 4,
+        })),
+      },
+    },
+  });
   assert.equal(legacy.proposal.stats.gapSightings, null);
   assert.equal(legacy.proposal.stats.orchestrationGapSightings, null);
   assert.equal(legacy.proposal.stats.reportOnlyGapClusters, null);
+  assert.equal(legacy.proposal.stats.reportOnlyByReason, null);
   assert.equal(legacy.proposal.stats.droppedGapSingletons, null);
+  assert.equal(legacy.proposal.stats.instructionsWithNegatives, null);
+  assert.equal(legacy.proposal.stats.instructionsLeftAlone, null, "legacy instruction rows do not invent counts");
+  assert.equal(legacy.proposal.stats.leftAloneMaxSessions, null);
+  assert.equal(legacy.proposal.stats.instructionsSuppressed, null);
+});
+
+test("the funnel's left-alone count names the candidates no accepted edit touched", () => {
+  const edit = memoryEdit((t) => t.replace("- Use Node 18 via nvm before running any script.\n", ""));
+  const annotation = { edits: [claim(["H1"], { kind: "remove", title: "drop the stale Node pin" })] };
+  const row = (instruction, negative, nonComplianceSessions) => ({
+    instruction,
+    positive: 0,
+    negative,
+    nonComplianceSessions,
+    harmSessions: 4,
+    sessions: 4,
+    relevance: 1,
+    quotes: [],
+  });
+
+  const gated = gate({
+    edit,
+    annotation,
+    context: {
+      summary: {
+        analyzedSessions: 4,
+        totals: {
+          positive: 0,
+          negative: 4,
+          gapClusters: 0,
+          gapSightings: 0,
+          reportOnlyGapClusters: 0,
+          reportOnlyByReason: { majorityOrchestration: 0, belowFloorMixed: 0, tooFewProjects: 0 },
+          droppedGapSingletons: 0,
+          instructionsWithNegatives: 2,
+        },
+        instructions: [
+          // The accepted edit claims no instruction, so every candidate is left alone.
+          row("AG-001", 3, 0),
+          row("AG-002", 1, 1),
+          // Only positives: never a candidate, so never "left alone" either.
+          { ...row("AG-003", 0, 0), positive: 5 },
+        ],
+      },
+    },
+  });
+  assert.deepEqual(gated.violations, []);
+  assert.equal(gated.proposal.stats.instructionsLeftAlone, 2);
+  assert.equal(gated.proposal.stats.leftAloneMaxSessions, 1, "the maximum does not imply every count is one");
+  assert.ok(
+    funnelLines(renderTemplateScript(gated.proposal)).some(
+      (line) => line.drop === "2 dropped - no accepted edit named these candidates",
+    ),
+  );
+
+  // An edit that names one of them removes it from the count, and the surviving
+  // candidate's session count is reported as it stands.
+  const claimed = gate({
+    edit,
+    annotation: { edits: [claim(["H1"], { kind: "remove", title: "drop it", instructions: ["AG-001"] })] },
+    context: {
+      summary: {
+        analyzedSessions: 4,
+        totals: {
+          positive: 3,
+          negative: 2,
+          gapClusters: 1,
+          gapSightings: 1,
+          reportOnlyGapClusters: 0,
+          reportOnlyByReason: { majorityOrchestration: 0, belowFloorMixed: 0, tooFewProjects: 0 },
+          droppedGapSingletons: 0,
+          instructionsWithNegatives: 2,
+        },
+        instructions: [row("AG-001", 3, 1), row("AG-002", 1, 6), { ...row("AG-003", 0, 0), positive: 5 }],
+      },
+    },
+  });
+  assert.deepEqual(claimed.violations, []);
+  assert.equal(claimed.proposal.stats.instructionsLeftAlone, 1);
+  assert.equal(claimed.proposal.stats.leftAloneMaxSessions, 6);
+});
+
+test("the funnel's display counters never change which edits are proposed or refused", () => {
+  const edit = memoryEdit((t) => t.replace("- Use Node 18 via nvm before running any script.\n", ""));
+  const annotation = { edits: [claim(["H1"], { kind: "remove", title: "drop the stale Node pin" })] };
+  const instructions = Array.from({ length: 20 }, (_, i) => ({
+    instruction: `AG-${String(i + 1).padStart(3, "0")}`,
+    positive: 0,
+    negative: 4,
+    nonComplianceSessions: 4,
+    harmSessions: 4,
+    sessions: 4,
+    relevance: 1,
+    quotes: [],
+  }));
+  const totals = { positive: 3, negative: 2, gapClusters: 1, gapSightings: 9, droppedGapSingletons: 3 };
+
+  const withCounters = gate({
+    edit,
+    annotation,
+    context: {
+      summary: {
+        analyzedSessions: 4,
+        totals: {
+          ...totals,
+          instructionsWithNegatives: 20,
+          reportOnlyGapClusters: 2,
+          reportOnlyByReason: { majorityOrchestration: 2, belowFloorMixed: 0, tooFewProjects: 0 },
+        },
+        instructions,
+      },
+    },
+  });
+  const without = gate({
+    edit,
+    annotation,
+    context: { summary: { analyzedSessions: 4, totals, instructions } },
+  });
+
+  assert.deepEqual(withCounters.violations, without.violations);
+  assert.deepEqual(withCounters.proposal.edits, without.proposal.edits);
 });
 
 test("a proposal that would exceed the budget fails the gate", () => {
@@ -662,7 +1341,9 @@ test("an extract cannot bypass addition evidence without removing memory text", 
   const unsupported = gate({
     files,
     edit: addOnly,
-    annotation: { edits: [claim(["H1", "H2"], { kind: "extract", title: "add setup guidance", transcripts: 1 })] },
+    annotation: {
+      edits: [claim(["H1", "H2"], { kind: "extract", title: "add setup guidance", evidence: ONE_SESSION })],
+    },
   });
   assert.ok(
     unsupported.violations.some((violation) => /adds a new instruction backed by 1 session/.test(violation)),
@@ -678,6 +1359,50 @@ test("an extract cannot bypass addition evidence without removing memory text", 
     corroborated.violations.some((violation) => /kind "extract" must remove text/.test(violation)),
     corroborated.violations.join("\n"),
   );
+});
+
+test("addition project counts come from folded gap evidence", () => {
+  const edit = memoryEdit((text) => `${text}- Include the full pull request URL.\n`);
+  const annotation = { edits: [claim(["H1"], { kind: "add" })] };
+  const summary = (projects) => ({
+    analyzedSessions: 3,
+    totals: { positive: 0, negative: 0, gapClusters: 1 },
+    instructions: [],
+    gaps: [
+      {
+        proposedInstruction: "Include the full pull request URL.",
+        sessions: 3,
+        projects,
+        quotes: [{ text: QUOTE[0].text, source: QUOTE[0].source }],
+      },
+    ],
+  });
+
+  const oneProject = gate({
+    edit,
+    annotation,
+    config: config({ minGapProjects: 2 }),
+    context: { summary: summary(1), scope: { kind: "user" } },
+  });
+  assert.ok(oneProject.violations.some((violation) => /evidence from 1 project/.test(violation)));
+
+  const twoProjects = gate({
+    edit,
+    annotation,
+    config: config({ minGapProjects: 2 }),
+    context: { summary: summary(2), scope: { kind: "user" } },
+  });
+  assert.deepEqual(twoProjects.violations, []);
+  assert.equal(twoProjects.proposal.edits[0].projects, 2);
+
+  const projectScope = gate({
+    edit,
+    annotation,
+    config: config({ minGapProjects: 2 }),
+    context: { summary: summary(1), scope: { kind: "project" } },
+  });
+  assert.deepEqual(projectScope.violations, []);
+  assert.equal(projectScope.proposal.edits[0].projects, undefined);
 });
 
 test("a move repositions verbatim memory-file text without the harm floor", () => {
@@ -828,28 +1553,68 @@ test("a skill's description can be rewritten in place; deletions and stray files
     annotation: { edits: [claim(["H1"])] },
   });
   assert.deepEqual(stray.violations, []);
-  assert.ok(stray.proposal.notes.some((n) => /ignored notes\.md/.test(n)));
+  assert.ok(stray.proposal.notes.some((n) => n === `ignored notes.md: ${STRAY_OUTSIDE_SURFACE}`));
 });
 
 test("a previously rejected edit is suppressed until new evidence arrives", () => {
   const edit = memoryEdit((t) => t.replace("- Use Node 18 via nvm before running any script.\n", ""));
   const first = gate({
     edit,
-    annotation: { edits: [claim(["H1"], { kind: "remove", title: "drop the stale Node pin" })] },
+    annotation: {
+      edits: [claim(["H1"], { kind: "remove", title: "drop the stale Node pin", instructions: ["AG-001"] })],
+    },
   });
   const rejections = recordRejection(first.proposal.edits[0], { version: 1, entries: {} });
 
   const suppressed = gate({
     edit,
-    annotation: { edits: [claim(["H1"], { kind: "remove", title: "drop the stale Node pin" })] },
-    context: { rejections, isSuppressed: isSuppressedByRejection },
+    annotation: {
+      edits: [claim(["H1"], { kind: "remove", title: "drop the stale Node pin", instructions: ["AG-001"] })],
+    },
+    context: {
+      rejections,
+      isSuppressed: isSuppressedByRejection,
+      summary: {
+        analyzedSessions: 4,
+        totals: {
+          positive: 3,
+          negative: 80,
+          gapClusters: 1,
+          gapSightings: 1,
+          reportOnlyGapClusters: 0,
+          reportOnlyByReason: { majorityOrchestration: 0, belowFloorMixed: 0, tooFewProjects: 0 },
+          droppedGapSingletons: 0,
+          instructionsWithNegatives: 20,
+        },
+        instructions: Array.from({ length: 20 }, (_, i) => ({
+          instruction: `AG-${String(i + 1).padStart(3, "0")}`,
+          negative: 4,
+          harmSessions: 4,
+          sessions: 4,
+        })),
+      },
+    },
   });
   assert.equal(suppressed.proposal.edits.length, 0, "same evidence weight stays rejected");
   assert.deepEqual(suppressed.violations, [], "a suppressed edit is dropped, not a violation");
+  assert.equal(suppressed.proposal.stats.instructionsLeftAlone, 19);
+  assert.equal(suppressed.proposal.stats.instructionsSuppressed, 1);
 
   const revived = gate({
     edit,
-    annotation: { edits: [claim(["H1"], { kind: "remove", title: "drop the stale Node pin", transcripts: 9 })] },
+    annotation: {
+      edits: [
+        claim(["H1"], {
+          kind: "remove",
+          title: "drop the stale Node pin",
+          evidence: [
+            ...QUOTE,
+            { polarity: "negative", text: "a third session hit the same pin", source: "pi · ghi · turn 2" },
+          ],
+          instructions: ["AG-001"],
+        }),
+      ],
+    },
     context: { rejections, isSuppressed: isSuppressedByRejection },
   });
   assert.equal(revived.proposal.edits.length, 1, "materially new evidence revives the edit");
@@ -1325,6 +2090,78 @@ test("an accepted extract writes the skill the agent drafted, in the canonical l
   assert.ok(fs.readFileSync(path.join(repo.root, "AGENTS.md"), "utf8").includes("See the release-signing skill."));
 });
 
+test("apply refuses a skillsDir that disagrees with the one baked into the proposal, rather than writing to the stale path", () => {
+  const skillText =
+    "---\nname: release-signing\ndescription: Load before tagging a release.\n---\n\n- Use Node 18 via nvm before running any script.\n\n## Steps\n\n1. sign\n";
+  const { proposal, repo, state } = gate({
+    edit: (root) => {
+      writeIn(root, "AGENTS.md", (t) =>
+        t.replace("- Use Node 18 via nvm before running any script.", "- See the release-signing skill."),
+      );
+      writeIn(root, ".agents/skills/release-signing/SKILL.md", skillText);
+    },
+    annotation: { edits: [claim(["H1", "H2"], { kind: "extract", title: "x" })] },
+  });
+  assert.equal(proposal.config.skillsDir, ".agents/skills");
+
+  const results = applyDecisions({
+    proposal,
+    decisions: { e1: "accepted" },
+    repo,
+    state,
+    config: { budgetTokens: 5000, skillsDir: "other/skills" },
+  });
+
+  assert.equal(results.written.length, 0, "a refused apply must write nothing");
+  assert.ok(
+    results.failed.some((f) => /skillsDir=\.agents\/skills/.test(f.error) && /skillsDir=other\/skills/.test(f.error)),
+    `expected a named skillsDir mismatch, got ${JSON.stringify(results.failed)}`,
+  );
+  assert.ok(
+    !fs.existsSync(path.join(repo.root, ".agents/skills/release-signing/SKILL.md")),
+    "nothing lands at the stale propose-time path",
+  );
+  assert.ok(
+    !fs.existsSync(path.join(repo.root, "other/skills/release-signing/SKILL.md")),
+    "nothing lands at the newly configured path either - a mismatch is refused, never remapped",
+  );
+  assert.equal(
+    fs.readFileSync(path.join(repo.root, "AGENTS.md"), "utf8"),
+    MEMORY_TEXT,
+    "a refused apply must leave the memory file untouched",
+  );
+});
+
+test("apply accepts a skillsDir spelled differently but naming the same directory as the proposal", () => {
+  const skillText =
+    "---\nname: release-signing\ndescription: Load before tagging a release.\n---\n\n- Use Node 18 via nvm before running any script.\n\n## Steps\n\n1. sign\n";
+  const { proposal, repo, state } = gate({
+    edit: (root) => {
+      writeIn(root, "AGENTS.md", (t) =>
+        t.replace("- Use Node 18 via nvm before running any script.", "- See the release-signing skill."),
+      );
+      writeIn(root, ".agents/skills/release-signing/SKILL.md", skillText);
+    },
+    annotation: { edits: [claim(["H1", "H2"], { kind: "extract", title: "x" })] },
+  });
+  assert.equal(proposal.config.skillsDir, ".agents/skills");
+
+  const results = applyDecisions({
+    proposal,
+    decisions: { e1: "accepted" },
+    repo,
+    state,
+    config: { budgetTokens: 5000, skillsDir: "./.agents/skills" },
+  });
+
+  assert.equal(
+    results.failed.length,
+    0,
+    `an equivalent spelling must not be refused: ${JSON.stringify(results.failed)}`,
+  );
+  assert.ok(fs.existsSync(path.join(repo.root, ".agents/skills/release-signing/SKILL.md")));
+});
+
 test("a dry run reports what it would write without touching the file", () => {
   const { proposal, repo, state } = gate({
     edit: memoryEdit((t) => t.replace("- Use Node 18 via nvm before running any script.\n", "")),
@@ -1426,18 +2263,25 @@ test("renderApplySurface writes one valid document through the real template", (
   assert.deepEqual(extractInjectedPayload(html), { ...payload, toolVersion: "0.1.0" });
 });
 
-test("the apply surface separates memory, description, and on-trigger deltas", () => {
+// Runs the real template's own script against a DOM stub small enough to keep the
+// assertions textual: the surface is exercised as the browser would build it, not mocked.
+function renderTemplateScript(proposal) {
   class Node {
     constructor(text = "") {
       this.textContent = text;
+      this.className = "";
       this.children = [];
       this.style = {};
+      this.attrs = {};
+      this.hidden = false;
     }
     appendChild(child) {
       this.children.push(child);
       return child;
     }
-    setAttribute() {}
+    setAttribute(name, value) {
+      this.attrs[name] = value;
+    }
     addEventListener() {}
   }
   const nodes = new Map();
@@ -1449,7 +2293,35 @@ test("the apply surface separates memory, description, and on-trigger deltas", (
       return nodes.get(id);
     },
   };
+  const repo = makeRepo();
+  const target = renderApplySurface(proposal, new State(repo.root), "0.1.0");
+  const html = fs.readFileSync(target, "utf8");
+  const window = {};
+  window.window = window;
+  for (const match of html.matchAll(/<script>([\s\S]*?)<\/script>/g)) {
+    vm.runInNewContext(match[1], { window, document });
+  }
   const textOf = (node) => node.textContent + node.children.map(textOf).join("");
+  return { nodes, textOf };
+}
+
+// The funnel band, read back the way it renders: one entry per bar or drop line.
+function funnelLines({ nodes, textOf }) {
+  return nodes.get("funnel-bars").children.map((row) => {
+    if (row.className === "fdrop") return { drop: textOf(row) };
+    if (row.className === "fconvert") return { conversion: textOf(row) };
+    const [label, track, value] = row.children;
+    return {
+      label: textOf(label),
+      value: textOf(value),
+      lanes: track.children.filter((c) => c.className === "a" || c.className === "b").map((c) => c.style.width),
+      overScale: track.children.find((c) => c.className === "overscale")?.attrs["data-l"],
+      cap: track.children.find((c) => c.className === "capline")?.style.left,
+    };
+  });
+}
+
+test("the apply surface separates memory, description, and on-trigger deltas", () => {
   const proposal = {
     generatedAt: "2026-08-01T00:00:00.000Z",
     repo: { name: "demo" },
@@ -1489,14 +2361,7 @@ test("the apply surface separates memory, description, and on-trigger deltas", (
       },
     ],
   };
-  const repo = makeRepo();
-  const target = renderApplySurface(proposal, new State(repo.root), "0.1.0");
-  const html = fs.readFileSync(target, "utf8");
-  const window = {};
-  window.window = window;
-  for (const match of html.matchAll(/<script>([\s\S]*?)<\/script>/g)) {
-    vm.runInNewContext(match[1], { window, document });
-  }
+  const { nodes, textOf } = renderTemplateScript(proposal);
 
   const cards = nodes.get("edits").children;
   assert.match(textOf(cards[0]), /Δ memory -20 tok/);
@@ -1512,6 +2377,224 @@ test("the apply surface separates memory, description, and on-trigger deltas", (
   assert.match(textOf(cards[1]), /Δ description \(always-loaded\) -2 tok/);
   assert.match(textOf(cards[1]), /file: \.agents\/skills\/db\/SKILL\.md/);
   assert.equal(nodes.get("gauge-title").textContent, "Always-loaded budget · AGENTS.md + skill descriptions");
+});
+
+test("the apply surface draws one funnel from findings to the edits it proposed", () => {
+  const rewrite = (id, removed = 1) => ({
+    id,
+    kind: "rewrite",
+    file: "AGENTS.md",
+    targetsMemoryFile: true,
+    hunks: [{ removed, added: 1 }],
+    evidence: [],
+  });
+  const proposal = {
+    generatedAt: "2026-09-02T00:00:00.000Z",
+    repo: { name: "user" },
+    memoryFile: { path: ".claude/CLAUDE.md" },
+    stats: {
+      harnessCounts: {},
+      transcripts: 82,
+      positive: 70,
+      negative: 27,
+      gapSightings: 36,
+      gapClusters: 1,
+      reportOnlyGapClusters: 1,
+      reportOnlyByReason: { majorityOrchestration: 1, belowFloorMixed: 0, tooFewProjects: 0 },
+      droppedGapSingletons: 32,
+      instructionsWithNegatives: 7,
+      instructionsLeftAlone: 2,
+      leftAloneMaxSessions: 1,
+      instructionsSuppressed: 1,
+      skillExtractions: 0,
+    },
+    config: { maxEditsPerRun: 5, minGapEvidence: 2 },
+    budget: { current: 4049, projected: 4117, capTokens: 5000, descriptionTokens: 0, mode: "cap" },
+    edits: [rewrite("e1"), rewrite("e2"), rewrite("e3"), rewrite("e4", 0)],
+  };
+  const rendered = renderTemplateScript(proposal);
+
+  const lines = funnelLines(rendered);
+  assert.deepEqual(
+    lines.map((l) => l.drop ?? l.conversion ?? `${l.label} ${l.value}`),
+    [
+      "findings 133",
+      "70 dropped - the instruction was followed: nothing to fix",
+      "22 dropped - duplicates: the same instruction or the same mistake, reported more than once",
+      "candidates 41",
+      "32 dropped - seen only once: a second session has to confirm them (kept for later runs)",
+      "1 dropped - not this project's fault: the tooling that ran the session caused it",
+      "sent to synthesis 8",
+      "2 dropped - no accepted edit named these candidates",
+      "1 dropped - a previous review rejected the same edit",
+      "counting changes here: 5 candidates · 4 proposed edits",
+      "edits proposed 4 of 5",
+    ],
+    "the many-to-many synthesis boundary names the unit conversion instead of implying candidates equal edits",
+  );
+  assert.ok(
+    !lines.some((l) => (l.drop || "").includes("too few projects")),
+    "a drop line that dropped nothing is never drawn",
+  );
+
+  // Every bar shares one scale (findings = 100%) so a lane can be followed down the
+  // band, and each bar splits into existing-instruction then missing-instruction.
+  const share = (n) => `${(n / 133) * 100}%`;
+  assert.deepEqual(
+    lines.filter((l) => l.label).map((l) => l.lanes),
+    [
+      [share(97), share(36)],
+      [share(7), share(34)],
+      [share(7), share(1)],
+      [share(3), share(1)],
+    ],
+  );
+  assert.equal(lines.at(-1).cap, share(5), "the cap tick sits on the same scale as the bar it crosses");
+
+  assert.equal(
+    rendered.textOf(rendered.nodes.get("funnel-facts")),
+    "82 transcripts · corroboration floor · 2 sessions · cap · 5 edits",
+  );
+  assert.equal(rendered.nodes.get("ctx").hidden, false, "the band frame is revealed");
+  assert.ok(!rendered.nodes.has("statrow"), "the band replaces the classic stat row rather than joining it");
+
+  const projectCovered = renderTemplateScript({ ...proposal, scope: "user" });
+  assert.ok(
+    funnelLines(projectCovered).some(
+      (line) =>
+        line.drop ===
+        "32 dropped - fewer than 2 sessions count toward corroboration: 2 qualifying sessions are required (kept for later runs)",
+    ),
+  );
+
+  const higherFloor = renderTemplateScript({
+    ...proposal,
+    config: { ...proposal.config, minGapEvidence: 3 },
+  });
+  assert.ok(
+    funnelLines(higherFloor).some(
+      (line) =>
+        line.drop ===
+        "32 dropped - seen in fewer than 3 sessions: 3 sessions have to confirm them (kept for later runs)",
+    ),
+  );
+
+  const projectFloor = (minGapProjects) =>
+    renderTemplateScript({
+      ...proposal,
+      config: { ...proposal.config, minGapProjects },
+      stats: {
+        ...proposal.stats,
+        reportOnlyByReason: { majorityOrchestration: 0, belowFloorMixed: 0, tooFewProjects: 1 },
+      },
+    });
+  assert.ok(
+    funnelLines(projectFloor(2)).some(
+      (line) =>
+        line.drop === "1 dropped - seen in too few projects: the same mistake has to show up in another project",
+    ),
+  );
+  assert.ok(
+    funnelLines(projectFloor(3)).some(
+      (line) => line.drop === "1 dropped - seen in too few projects: the same mistake has to show up in 3 projects",
+    ),
+  );
+
+  const overScale = renderTemplateScript({
+    ...proposal,
+    stats: {
+      ...proposal.stats,
+      positive: 0,
+      negative: 1,
+      gapSightings: 0,
+      gapClusters: 0,
+      reportOnlyGapClusters: 0,
+      reportOnlyByReason: { majorityOrchestration: 0, belowFloorMixed: 0, tooFewProjects: 0 },
+      droppedGapSingletons: 0,
+      instructionsWithNegatives: 1,
+      instructionsLeftAlone: 0,
+      instructionsSuppressed: 0,
+    },
+    edits: [rewrite("e1"), rewrite("e2", 0)],
+  });
+  const overScaleLines = funnelLines(overScale);
+  const findingsLine = overScaleLines.find((line) => line.label === "findings");
+  const proposedLine = overScaleLines.find((line) => line.label === "edits proposed");
+  assert.deepEqual(proposedLine.lanes, ["50%", "50%"], "the clamped bar preserves its lane split");
+  assert.equal(proposedLine.overScale, "1 over scale", "the clamped bar is visibly marked");
+  assert.equal(findingsLine.overScale, undefined, "an ordinary 100% bar has no over-scale marker");
+  assert.ok(
+    overScaleLines.some((line) => line.conversion === "counting changes here: 1 candidate · 2 proposed edits"),
+    "several edits from one candidate are an explicit unit conversion, not an unexplained gain",
+  );
+
+  const offScaleCap = renderTemplateScript({
+    ...proposal,
+    stats: {
+      ...proposal.stats,
+      positive: 0,
+      negative: 1,
+      gapSightings: 0,
+      gapClusters: 0,
+      reportOnlyGapClusters: 0,
+      reportOnlyByReason: { majorityOrchestration: 0, belowFloorMixed: 0, tooFewProjects: 0 },
+      droppedGapSingletons: 0,
+      instructionsWithNegatives: 1,
+      instructionsLeftAlone: 0,
+      instructionsSuppressed: 0,
+    },
+    edits: [rewrite("e1")],
+  });
+  const offScaleLines = funnelLines(offScaleCap);
+  assert.equal(offScaleLines.at(-1).cap, undefined, "an off-scale cap tick is hidden");
+  assert.ok(
+    offScaleLines.some((line) => line.conversion === "counting changes here: 1 candidate · 1 proposed edit"),
+    "equal numbers still name the change from candidate units to edit units",
+  );
+
+  const noCandidate = renderTemplateScript({
+    ...proposal,
+    stats: {
+      ...proposal.stats,
+      positive: 0,
+      negative: 0,
+      gapSightings: 0,
+      gapClusters: 0,
+      reportOnlyGapClusters: 0,
+      reportOnlyByReason: { majorityOrchestration: 0, belowFloorMixed: 0, tooFewProjects: 0 },
+      droppedGapSingletons: 0,
+      instructionsWithNegatives: 0,
+      instructionsLeftAlone: 0,
+      instructionsSuppressed: 0,
+    },
+    edits: [rewrite("e1")],
+  });
+  assert.ok(
+    funnelLines(noCandidate).some(
+      (line) => line.conversion === "counting changes here: 0 candidates · 1 proposed edit",
+    ),
+    "an edit with no candidate attribution is visible instead of appearing as an unexplained gain",
+  );
+});
+
+test("a proposal saved before the funnel counts existed falls back to the classic stat row", () => {
+  const legacy = {
+    generatedAt: "2026-08-01T00:00:00.000Z",
+    repo: { name: "demo" },
+    memoryFile: { path: "AGENTS.md" },
+    // Recorded when only the gap funnel existed: no lane counts, so no band.
+    stats: { harnessCounts: {}, transcripts: 9, positive: 4, negative: 2, gapClusters: 1, skillExtractions: 0 },
+    config: { maxEditsPerRun: 5, minGapEvidence: 2 },
+    budget: { current: 10, projected: 12, capTokens: 100, descriptionTokens: 0, mode: "cap" },
+    edits: [],
+  };
+  const rendered = renderTemplateScript(legacy);
+
+  assert.ok(!rendered.nodes.has("funnel-bars"), "no band is drawn without the counts it needs");
+  assert.ok(!rendered.nodes.has("ctx"), "the band frame stays hidden as the markup shipped it");
+  assert.equal(rendered.nodes.get("statrow").hidden, false);
+  assert.equal(rendered.nodes.get("statrow").children.length, 5);
+  assert.match(rendered.textOf(rendered.nodes.get("statrow")), /positive evidence/);
 });
 
 test("terminal review labels every file in a multi-file extraction", () => {
@@ -1757,7 +2840,19 @@ test("sentence-level harm clears removal of its oversized parent paragraph", () 
   const result = gate({
     text,
     edit: memoryEdit((current) => current.replace(`${blob}\n\n`, "")),
-    annotation: { edits: [claim(["H1"], { kind: "remove", title: "remove the harmful paragraph" })] },
+    annotation: {
+      edits: [
+        claim(["H1"], {
+          kind: "remove",
+          title: "remove the harmful paragraph",
+          evidence: summary.sources.map((source, i) => ({
+            polarity: "negative",
+            text: `harm quote ${i}`,
+            source,
+          })),
+        }),
+      ],
+    },
     context: { summary },
   });
   assert.deepEqual(result.violations, []);
@@ -2114,6 +3209,450 @@ test("a skill-only shrink reports the remaining always-loaded overage", () => {
   assert.ok(results.written[0].budget.delta < 0);
   assert.ok(results.written[0].budget.projected > 100);
   assert.match(results.warnings[0], /always-loaded surface \(AGENTS\.md \+ skill descriptions\)/);
+});
+
+test("a skill linked out of the repo behind an in-repo library never reaches apply, and nothing outside is written", () => {
+  const skill = "---\nname: db\ndescription: old trigger\n---\n\nbody\n";
+  const outside = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "backpass-outside-apply-")));
+  fs.writeFileSync(path.join(outside, "SKILL.md"), skill);
+
+  const repo = makeRepo({ "AGENTS.md": MEMORY_TEXT });
+  fs.mkdirSync(path.join(repo.root, "library", "db"), { recursive: true });
+  fs.symlinkSync(path.join(outside, "SKILL.md"), path.join(repo.root, "library", "db", "SKILL.md"));
+  const loaded = path.join(repo.root, ".agents", "skills");
+  fs.mkdirSync(loaded, { recursive: true });
+  fs.symlinkSync(path.join(repo.root, "library", "db"), path.join(loaded, "db"));
+
+  const staged = stageAndMeasure({
+    repo,
+    edit: (root) => {
+      writeIn(root, "AGENTS.md", (text) =>
+        text.replace("- Whenever a PR is mentioned, include its URL.", "- Always include the full PR URL."),
+      );
+      const copy = path.join(root, ".agents/skills/db/SKILL.md");
+      if (fs.existsSync(copy)) fs.writeFileSync(copy, skill.replace("old trigger", "new trigger"));
+    },
+  });
+  assert.deepEqual(
+    staged.measured.changes.map((change) => change.file),
+    ["AGENTS.md"],
+    "the out-of-repo skill file was never staged, so it cannot become an edit",
+  );
+
+  const built = buildProposal(
+    { edits: staged.measured.changes.map((change) => claim([change.id])) },
+    {
+      memoryFile: staged.memoryFile,
+      config: config(),
+      repo,
+      summary: {
+        analyzedSessions: 4,
+        totals: { positive: 3, negative: 2, gapClusters: 1 },
+        instructions: Array.from({ length: 20 }, (_, i) => ({
+          instruction: `AG-${String(i + 1).padStart(3, "0")}`,
+          positive: 0,
+          negative: 4,
+          harmSessions: 4,
+          sessions: 4,
+          relevance: 1,
+          quotes: [],
+        })),
+      },
+      measured: staged.measured,
+    },
+  );
+  assert.deepEqual(built.violations, []);
+
+  const results = applyDecisions({
+    proposal: built.proposal,
+    decisions: Object.fromEntries(built.proposal.edits.map((edit) => [edit.id, "accepted"])),
+    repo,
+    state: staged.state,
+    config: { budgetTokens: 5000 },
+  });
+
+  assert.deepEqual(results.failed, []);
+  assert.match(fs.readFileSync(path.join(repo.root, "AGENTS.md"), "utf8"), /Always include the full PR URL/);
+  assert.equal(fs.readFileSync(path.join(outside, "SKILL.md"), "utf8"), skill, "nothing outside the repository moved");
+});
+
+test("re-creating a withheld unwritable skill is stray, so the round is not dropped", () => {
+  const skill = "---\nname: db\ndescription: old trigger\n---\n\nbody\n";
+  const store = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "backpass-store-recreate-")));
+  fs.mkdirSync(path.join(store, "db"));
+  fs.writeFileSync(path.join(store, "db", "SKILL.md"), skill);
+
+  const repo = makeRepo({ "AGENTS.md": MEMORY_TEXT });
+  const loaded = path.join(repo.root, ".agents", "skills");
+  fs.mkdirSync(loaded, { recursive: true });
+  fs.symlinkSync(path.join(store, "db"), path.join(loaded, "db"));
+  fs.chmodSync(path.join(store, "db"), 0o555);
+  fs.chmodSync(store, 0o555);
+
+  try {
+    const extracted =
+      "---\nname: db\ndescription: Load before node work.\n---\n\n- Use Node 18 via nvm before running any script.\n";
+    const staged = stageAndMeasure({
+      repo,
+      allowExternal: true,
+      edit: (root) => {
+        writeIn(root, "AGENTS.md", (text) => text.replace("- Use Node 18 via nvm before running any script.\n", ""));
+        // The index shows `db` read-only, but the model still has its path and the
+        // extraction rule points at the skill that already covers the lines.
+        writeIn(root, ".agents/skills/db/SKILL.md", extracted);
+      },
+    });
+    assert.deepEqual(staged.measured.stray, [{ file: ".agents/skills/db/SKILL.md", reason: STRAY_UNWRITABLE }]);
+    assert.deepEqual(
+      staged.measured.changes.map((change) => change.file),
+      ["AGENTS.md"],
+      "the withheld skill is not carried back in as a created file",
+    );
+
+    const ids = staged.measured.changes.map((change) => change.id);
+    const built = buildProposal(
+      { edits: [claim(ids, { kind: "remove", title: "drop the node pin" })] },
+      {
+        memoryFile: staged.memoryFile,
+        config: config(),
+        repo,
+        summary: aliasSummary(),
+        measured: staged.measured,
+      },
+    );
+    assert.deepEqual(built.violations, []);
+
+    const results = applyDecisions({
+      proposal: { ...built.proposal, scope: "user" },
+      decisions: Object.fromEntries(built.proposal.edits.map((edit) => [edit.id, "accepted"])),
+      repo,
+      state: staged.state,
+      config: { budgetTokens: 5000 },
+    });
+
+    assert.deepEqual(results.failed, []);
+    const written = fs.readFileSync(path.join(repo.root, "AGENTS.md"), "utf8");
+    assert.ok(!written.includes("Node 18"), "the accepted memory edit still landed");
+    assert.equal(fs.readFileSync(path.join(store, "db", "SKILL.md"), "utf8"), skill, "the store is untouched");
+  } finally {
+    fs.chmodSync(store, 0o755);
+    fs.chmodSync(path.join(store, "db"), 0o755);
+  }
+});
+
+test("a skill in a read-only store never joins a user-scope apply round, so the round still lands", () => {
+  const skill = "---\nname: db\ndescription: old trigger\n---\n\nbody\n";
+  const store = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "backpass-store-apply-")));
+  fs.mkdirSync(path.join(store, "db"));
+  fs.writeFileSync(path.join(store, "db", "SKILL.md"), skill);
+
+  const repo = makeRepo({ "AGENTS.md": MEMORY_TEXT });
+  const loaded = path.join(repo.root, ".agents", "skills");
+  fs.mkdirSync(loaded, { recursive: true });
+  fs.symlinkSync(path.join(store, "db"), path.join(loaded, "db"));
+  fs.chmodSync(path.join(store, "db"), 0o555);
+  fs.chmodSync(store, 0o555);
+
+  try {
+    const staged = stageAndMeasure({
+      repo,
+      allowExternal: true,
+      edit: (root) => {
+        writeIn(root, "AGENTS.md", (text) =>
+          text.replace("- Whenever a PR is mentioned, include its URL.", "- Always include the full PR URL."),
+        );
+        const copy = path.join(root, ".agents/skills/db/SKILL.md");
+        if (fs.existsSync(copy)) fs.writeFileSync(copy, skill.replace("old trigger", "new trigger"));
+      },
+    });
+    assert.deepEqual(
+      staged.measured.changes.map((change) => change.file),
+      ["AGENTS.md"],
+      "the store-backed skill was never staged, so it cannot become an edit",
+    );
+
+    const built = buildProposal(
+      { edits: staged.measured.changes.map((change) => claim([change.id])) },
+      {
+        memoryFile: staged.memoryFile,
+        config: config(),
+        repo,
+        summary: aliasSummary(),
+        measured: staged.measured,
+      },
+    );
+    assert.deepEqual(built.violations, []);
+
+    const results = applyDecisions({
+      proposal: { ...built.proposal, scope: "user" },
+      decisions: Object.fromEntries(built.proposal.edits.map((edit) => [edit.id, "accepted"])),
+      repo,
+      state: staged.state,
+      config: { budgetTokens: 5000 },
+    });
+
+    assert.deepEqual(results.failed, []);
+    assert.match(fs.readFileSync(path.join(repo.root, "AGENTS.md"), "utf8"), /Always include the full PR URL/);
+    assert.equal(fs.readFileSync(path.join(store, "db", "SKILL.md"), "utf8"), skill, "the store is untouched");
+  } finally {
+    fs.chmodSync(store, 0o755);
+    fs.chmodSync(path.join(store, "db"), 0o755);
+  }
+});
+
+test("a file written at the unstaged alias becomes stray, so the round is not dropped", () => {
+  const skill = "---\nname: db\ndescription: old trigger\n---\n\nbody\n";
+  const repo = makeRepo({ "AGENTS.md": MEMORY_TEXT, "library/db/SKILL.md": skill });
+  const loaded = path.join(repo.root, ".agents", "skills");
+  fs.mkdirSync(loaded, { recursive: true });
+  fs.symlinkSync(path.join(repo.root, "library", "db"), path.join(loaded, "db"));
+  fs.symlinkSync(path.join(repo.root, "library", "db"), path.join(loaded, "database"));
+
+  const extracted =
+    "---\nname: db\ndescription: Load before node work.\n---\n\n- Use Node 18 via nvm before running any script.\n";
+  const staged = stageAndMeasure({
+    repo,
+    edit: (root) => {
+      writeIn(root, "AGENTS.md", (text) => text.replace("- Use Node 18 via nvm before running any script.\n", ""));
+      // The index marks `db` read-only, but its path is the one the model was shown.
+      writeIn(root, ".agents/skills/db/SKILL.md", extracted);
+    },
+  });
+  assert.deepEqual(staged.measured.stray, [
+    { file: ".agents/skills/db/SKILL.md", reason: strayAliasReason(".agents/skills/database/SKILL.md") },
+  ]);
+  assert.deepEqual(
+    staged.measured.changes.map((change) => change.file),
+    ["AGENTS.md"],
+    "the alias is not carried back in as a created file",
+  );
+
+  const ids = staged.measured.changes.map((change) => change.id);
+  const built = buildProposal(
+    { edits: [claim(ids, { kind: "remove", title: "drop the node pin" })] },
+    {
+      memoryFile: staged.memoryFile,
+      config: config(),
+      repo,
+      summary: aliasSummary(),
+      measured: staged.measured,
+    },
+  );
+  assert.deepEqual(built.violations, []);
+
+  const results = applyDecisions({
+    proposal: built.proposal,
+    decisions: Object.fromEntries(built.proposal.edits.map((edit) => [edit.id, "accepted"])),
+    repo,
+    state: staged.state,
+    config: { budgetTokens: 5000 },
+  });
+
+  assert.deepEqual(results.failed, []);
+  const written = fs.readFileSync(path.join(repo.root, "AGENTS.md"), "utf8");
+  assert.ok(!written.includes("Node 18"), "the accepted memory edit still landed");
+  assert.equal(fs.readFileSync(path.join(repo.root, "library/db/SKILL.md"), "utf8"), skill);
+});
+
+test("a k-linked skill projects its description delta k times, matching the post-apply surface", () => {
+  const oldDescription = "old trigger";
+  const newDescription = "Load before touching the database or writing a migration";
+  const skill = `---\nname: db\ndescription: ${oldDescription}\n---\n\nbody\n`;
+  const repo = makeRepo({ "AGENTS.md": MEMORY_TEXT, "library/db/SKILL.md": skill });
+  const loaded = path.join(repo.root, ".agents", "skills");
+  fs.mkdirSync(loaded, { recursive: true });
+  // Three names for one file: the harness loads three description lines, so an edit to
+  // that line moves the always-loaded surface by three times its delta.
+  for (const name of ["db", "database", "sql"]) {
+    fs.symlinkSync(path.join(repo.root, "library", "db"), path.join(loaded, name));
+  }
+
+  const staged = stageAndMeasure({
+    repo,
+    edit: (root) => {
+      for (const name of ["db", "database", "sql"]) {
+        const copy = path.join(root, ".agents/skills", name, "SKILL.md");
+        if (fs.existsSync(copy)) fs.writeFileSync(copy, skill.replace(oldDescription, newDescription));
+      }
+    },
+  });
+  const built = buildProposal(
+    {
+      edits: [
+        claim(
+          staged.measured.changes.map((change) => change.id),
+          { title: "sharpen the trigger" },
+        ),
+      ],
+    },
+    {
+      memoryFile: staged.memoryFile,
+      config: config(),
+      repo,
+      summary: aliasSummary(),
+      measured: staged.measured,
+      skillFiles: loadProjectSkills(repo.root, ".agents/skills", []),
+    },
+  );
+  assert.deepEqual(built.violations, []);
+
+  const results = applyDecisions({
+    proposal: built.proposal,
+    decisions: Object.fromEntries(built.proposal.edits.map((edit) => [edit.id, "accepted"])),
+    repo,
+    state: staged.state,
+    config: { budgetTokens: 5000 },
+  });
+  assert.deepEqual(results.failed, []);
+
+  // The projection the gate enforced must equal what a fresh measurement now reports.
+  const after =
+    estimateTokens(fs.readFileSync(path.join(repo.root, "AGENTS.md"), "utf8")) +
+    skillDescriptionTokens(loadProjectSkills(repo.root, ".agents/skills", []));
+  assert.equal(built.proposal.budget.projected, after);
+  assert.equal(built.proposal.budget.delta, 3 * (estimateTokens(newDescription) - estimateTokens(oldDescription)));
+});
+
+test("two links to one library leave one writable copy, so an apply round is not refused for colliding targets", () => {
+  const skill = "---\nname: db\ndescription: old trigger\n---\n\nbody\n";
+  const repo = makeRepo({ "AGENTS.md": MEMORY_TEXT, "library/db/SKILL.md": skill });
+  const loaded = path.join(repo.root, ".agents", "skills");
+  fs.mkdirSync(loaded, { recursive: true });
+  fs.symlinkSync(path.join(repo.root, "library", "db"), path.join(loaded, "db"));
+  fs.symlinkSync(path.join(repo.root, "library", "db"), path.join(loaded, "database"));
+
+  // The agent edits every skill copy its staging cwd holds, alongside the memory file.
+  const staged = stageAndMeasure({
+    repo,
+    edit: (root) => {
+      writeIn(root, "AGENTS.md", (text) =>
+        text.replace("- Whenever a PR is mentioned, include its URL.", "- Always include the full PR URL."),
+      );
+      for (const name of ["db", "database"]) {
+        const copy = path.join(root, ".agents/skills", name, "SKILL.md");
+        if (fs.existsSync(copy)) fs.writeFileSync(copy, skill.replace("old trigger", "new trigger"));
+      }
+    },
+  });
+  assert.deepEqual(
+    [...new Set(staged.measured.changes.map((change) => change.file))],
+    ["AGENTS.md", ".agents/skills/database/SKILL.md"],
+    "one library file yields one editable path, whatever the harness calls it",
+  );
+
+  const built = buildProposal(
+    { edits: staged.measured.changes.map((change) => claim([change.id])) },
+    {
+      memoryFile: staged.memoryFile,
+      config: config(),
+      repo,
+      summary: {
+        analyzedSessions: 4,
+        totals: { positive: 3, negative: 2, gapClusters: 1 },
+        instructions: Array.from({ length: 20 }, (_, i) => ({
+          instruction: `AG-${String(i + 1).padStart(3, "0")}`,
+          positive: 0,
+          negative: 4,
+          harmSessions: 4,
+          sessions: 4,
+          relevance: 1,
+          quotes: [],
+        })),
+      },
+      measured: staged.measured,
+    },
+  );
+  assert.deepEqual(built.violations, []);
+
+  const results = applyDecisions({
+    proposal: built.proposal,
+    decisions: Object.fromEntries(built.proposal.edits.map((edit) => [edit.id, "accepted"])),
+    repo,
+    state: staged.state,
+    config: { budgetTokens: 5000 },
+  });
+
+  assert.deepEqual(results.failed, []);
+  assert.ok(results.written.some((entry) => entry.file === "AGENTS.md"));
+  assert.match(fs.readFileSync(path.join(repo.root, "AGENTS.md"), "utf8"), /Always include the full PR URL/);
+  assert.match(fs.readFileSync(path.join(repo.root, "library/db/SKILL.md"), "utf8"), /new trigger/);
+});
+
+test("a skill symlinked out of the repo never joins a project apply round, so it cannot abort one", () => {
+  const skill = "---\nname: db\ndescription: old trigger\n---\n\nbody\n";
+  const library = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "backpass-shared-skills-")));
+  fs.mkdirSync(path.join(library, "db"));
+  fs.writeFileSync(path.join(library, "db", "SKILL.md"), skill);
+
+  const repo = makeRepo({ "AGENTS.md": MEMORY_TEXT });
+  const loaded = path.join(repo.root, ".agents", "skills");
+  fs.mkdirSync(loaded, { recursive: true });
+  fs.symlinkSync(path.join(library, "db"), path.join(loaded, "db"));
+
+  // The synthesis agent edits whatever is in its staging cwd, so anything staged can
+  // become an accepted edit - and project scope cannot write a path that resolves
+  // outside the repository, which would drop the memory-file edits with it.
+  const staged = stageAndMeasure({
+    repo,
+    edit: (root) => {
+      writeIn(root, "AGENTS.md", (text) =>
+        text.replace("- Whenever a PR is mentioned, include its URL.", "- Always include the full PR URL."),
+      );
+      // Whether it edits the staged copy or writes the path fresh, the model reaches the
+      // same repository file - one apply could not write without dropping the round.
+      writeIn(root, ".agents/skills/db/SKILL.md", skill.replace("old trigger", "new trigger"));
+    },
+  });
+  assert.deepEqual(
+    staged.measured.changes.map((change) => change.file),
+    ["AGENTS.md"],
+    "the out-of-repo skill is neither staged nor measurable as a created file",
+  );
+  assert.deepEqual(staged.measured.stray, [{ file: ".agents/skills/db/SKILL.md", reason: STRAY_OUTSIDE_REPO }]);
+
+  const built = buildProposal(
+    { edits: staged.measured.changes.map((change) => claim([change.id])) },
+    {
+      memoryFile: staged.memoryFile,
+      config: config(),
+      repo,
+      summary: {
+        analyzedSessions: 4,
+        totals: { positive: 3, negative: 2, gapClusters: 1 },
+        instructions: Array.from({ length: 20 }, (_, i) => ({
+          instruction: `AG-${String(i + 1).padStart(3, "0")}`,
+          positive: 0,
+          negative: 4,
+          harmSessions: 4,
+          sessions: 4,
+          relevance: 1,
+          quotes: [],
+        })),
+      },
+      measured: staged.measured,
+    },
+  );
+  assert.deepEqual(built.violations, []);
+  assert.ok(
+    built.proposal.notes.some((note) => note === `ignored .agents/skills/db/SKILL.md: ${STRAY_OUTSIDE_REPO}`),
+    `the note must name the real cause: ${built.proposal.notes.join(" | ")}`,
+  );
+
+  const results = applyDecisions({
+    proposal: built.proposal,
+    decisions: Object.fromEntries(built.proposal.edits.map((edit) => [edit.id, "accepted"])),
+    repo,
+    state: staged.state,
+    config: { budgetTokens: 5000 },
+  });
+
+  assert.deepEqual(results.failed, []);
+  assert.deepEqual(
+    results.written.map((entry) => entry.file),
+    ["AGENTS.md"],
+  );
+  assert.match(fs.readFileSync(path.join(repo.root, "AGENTS.md"), "utf8"), /Always include the full PR URL/);
+  assert.equal(fs.readFileSync(path.join(library, "db", "SKILL.md"), "utf8"), skill, "the shared library is untouched");
 });
 
 test("a skill file that changed after the proposal refuses the apply; unchanged, the edit lands", () => {

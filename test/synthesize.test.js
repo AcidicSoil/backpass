@@ -80,6 +80,7 @@ const { foldEvidence } = await import("../src/fold.js");
 const { ProposalViolation } = await import("../src/proposal.js");
 const { State } = await import("../src/state.js");
 const { UserError, setLoggerSink } = await import("../src/logger.js");
+const { workspacePathFor } = await import("../src/workspace.js");
 const { makeRepo } = await import("./helpers/staging.js");
 
 setLoggerSink(() => {});
@@ -107,19 +108,24 @@ const QUOTE = {
   text: "the agent re-read the adapter fixture instead",
   source: "claude · s1 · turn 4",
 };
+// Every edit to the always-loaded surface clears the session floor, so the fixtures
+// quote two sessions; the count is measured from these, not declared.
+const QUOTE2 = {
+  polarity: "negative",
+  text: "and here it re-read the same fixture a second time",
+  source: "codex · s2 · turn 9",
+};
 const removal = (changes) => ({
   changes,
   kind: "remove",
   title: "drop two sharp edges nobody hits",
-  evidence: [QUOTE],
-  transcripts: 3,
+  evidence: [QUOTE, QUOTE2],
 });
 const tighten = (changes) => ({
   changes,
   kind: "rewrite",
   title: "sharpen the brevity rule",
-  evidence: [QUOTE],
-  transcripts: 2,
+  evidence: [QUOTE, QUOTE2],
 });
 
 function summaryFor(sessions = 3) {
@@ -140,9 +146,32 @@ function summaryFor(sessions = 3) {
 const pick = { agent: "claude", model: "claude-opus-5", effort: "high", pinned: true };
 const agents = { resolve: async () => pick, withFallthrough: async (_role, fn) => fn(pick) };
 
-function setup(script, { text = AGENTS, overrides = {}, summary = summaryFor() } = {}) {
-  const repo = makeRepo({ "AGENTS.md": text });
-  const config = loadConfig(repo.root, overrides);
+function setup(
+  script,
+  {
+    text = AGENTS,
+    overrides = {},
+    summary = summaryFor(),
+    scope = null,
+    externalMemory = false,
+    externalSkills = false,
+  } = {},
+) {
+  const repo = makeRepo(externalMemory ? {} : { "AGENTS.md": text });
+  const externalSkillsDir = externalSkills
+    ? path.join(fs.mkdtempSync(path.join(os.tmpdir(), "backpass-external-skills-")), "skills")
+    : null;
+  if (externalSkillsDir) {
+    fs.mkdirSync(path.join(externalSkillsDir, "db"), { recursive: true });
+    fs.writeFileSync(
+      path.join(externalSkillsDir, "db/SKILL.md"),
+      "---\nname: db\ndescription: Load for database work.\n---\n\n- Keep transactions short.\n",
+    );
+  }
+  const config = loadConfig(
+    repo.root,
+    externalSkillsDir ? { ...overrides, skillsDir: externalSkillsDir, skillsDirs: [externalSkillsDir] } : overrides,
+  );
   config.state = new State(repo.root).ensure();
   config.agents = agents;
   const log = path.join(fakeDir, `log-${Date.now()}-${Math.random().toString(16).slice(2)}.jsonl`);
@@ -151,8 +180,20 @@ function setup(script, { text = AGENTS, overrides = {}, summary = summaryFor() }
   process.env.FAKE_ACPX_SCRIPT = path.join(repo.root, "fake-script.json");
   process.env.FAKE_ACPX_STATE = path.join(repo.root, "fake-state.json");
   fs.writeFileSync(process.env.FAKE_ACPX_SCRIPT, JSON.stringify(script));
-  const memoryFile = readMemoryFile(repo.root, "AGENTS.md");
-  const run = () => synthesizeProposal({ memoryFile, summary, config, repo, transcripts: [{ harness: "claude" }] });
+  const memoryPath = externalMemory
+    ? path.join(fs.mkdtempSync(path.join(os.tmpdir(), "backpass-external-synth-")), "CLAUDE.md")
+    : "AGENTS.md";
+  if (externalMemory) fs.writeFileSync(memoryPath, text);
+  const memoryFile = readMemoryFile(repo.root, memoryPath, { allowExternal: externalMemory });
+  const run = () =>
+    synthesizeProposal({
+      memoryFile,
+      summary,
+      config,
+      repo,
+      transcripts: [{ harness: "claude" }],
+      scope,
+    });
   const calls = () =>
     fs
       .readFileSync(log, "utf8")
@@ -160,7 +201,7 @@ function setup(script, { text = AGENTS, overrides = {}, summary = summaryFor() }
       .split("\n")
       .filter(Boolean)
       .map((l) => JSON.parse(l));
-  return { repo, config, memoryFile, run, calls };
+  return { repo, config, memoryFile, externalSkillsDir, run, calls };
 }
 
 test("synthesis edits the staging copy natively; measured hunks anchor to the raw file and nothing touches the repo until apply", async () => {
@@ -363,6 +404,49 @@ test("a harness that writes to the repository instead of the staging copy is ref
   });
 });
 
+test("user synthesis can propose against relocated external memory", async () => {
+  const { run, memoryFile } = setup(
+    { edit: {}, annotations: [{ reply: { edits: [] } }] },
+    { scope: { kind: "user" }, externalMemory: true },
+  );
+  const { proposal, violations } = await run();
+  assert.deepEqual(violations, []);
+  assert.equal(proposal.memoryFile.path, memoryFile.path);
+  assert.equal(proposal.edits.length, 0);
+});
+
+test("a skill target in a relative external directory is staged and uses its actual staged path", async () => {
+  const setupResult = setup(
+    { edit: {}, annotations: [{ reply: { edits: [] } }] },
+    { scope: { kind: "user" }, externalSkills: true },
+  );
+  const relativeSkillsDir = path.relative(setupResult.repo.root, setupResult.externalSkillsDir);
+  setupResult.config.skillsDir = relativeSkillsDir;
+  setupResult.config.skillsDirs = [relativeSkillsDir];
+  setupResult.config.target = {
+    kind: "skill",
+    path: path.join(setupResult.externalSkillsDir, "db/SKILL.md"),
+    name: "db",
+  };
+  const stagedPath = `${workspacePathFor(setupResult.externalSkillsDir)}/db/SKILL.md`;
+  fs.writeFileSync(
+    process.env.FAKE_ACPX_SCRIPT,
+    JSON.stringify({
+      edit: { [stagedPath]: { replace: [["Load for database work.", "Load before database work or SQL changes."]] } },
+      annotations: [{ reply: { edits: [tighten(["H1"])] } }],
+    }),
+  );
+
+  const { proposal, violations } = await setupResult.run();
+  assert.deepEqual(violations, []);
+  assert.deepEqual(
+    proposal.edits.map((edit) => edit.file),
+    [path.join(setupResult.externalSkillsDir, "db/SKILL.md")],
+  );
+  const prompt = fs.readFileSync(path.join(setupResult.config.state.root, "prompts/synthesis-edit.md"), "utf8");
+  assert.ok(prompt.includes(`This run targets \`./${stagedPath}\` only`));
+});
+
 test("an agent that changes nothing yields an empty proposal, never an invented edit", async () => {
   const { run } = setup({ edit: {}, annotations: [{ reply: { edits: [], notes: ["the evidence is too thin"] } }] });
   const { proposal, violations } = await run();
@@ -433,10 +517,14 @@ test("an oversized non-compliance blob synthesizes as a list-item restructure, n
                   {
                     polarity: "negative",
                     text: "skipped the second sentence of the blob entirely here",
-                    source: "claude · s1 · turn 4",
+                    source: summary.sources[0],
+                  },
+                  {
+                    polarity: "negative",
+                    text: "the same blob's second sentence was skipped again",
+                    source: summary.sources[1],
                   },
                 ],
-                transcripts: 2,
                 instructions: ["AG-001.2"],
               },
             ],
@@ -474,4 +562,239 @@ test("an oversized non-compliance blob synthesizes as a list-item restructure, n
   assert.match(editPrompt, /### Oversized units that failed to steer/);
   assert.match(editPrompt, /Preferred reinforcement is a restructure-in-place/);
   assert.match(editPrompt, /bold label on the blob is not a strengthen/);
+});
+
+const DB_SKILL = "---\nname: db\ndescription: Load for database work.\n---\n\n- Keep transactions short.\n";
+
+test("a memory-file target never stages existing skills, and the run proposes only against the memory file", async () => {
+  const { repo, config, run } = setup({
+    edit: { "AGENTS.md": { replace: [["- Keep this file short.\n", "- Keep this file short; point at files.\n"]] } },
+    annotations: [{ reply: { edits: [tighten(["H1"])] } }],
+  });
+  fs.mkdirSync(path.join(repo.root, ".agents/skills/db"), { recursive: true });
+  fs.writeFileSync(path.join(repo.root, ".agents/skills/db/SKILL.md"), DB_SKILL);
+  config.target = { kind: "memory", path: "AGENTS.md" };
+  const { proposal, violations } = await run();
+  assert.deepEqual(violations, []);
+  assert.deepEqual(proposal.target, { kind: "memory", path: "AGENTS.md" });
+  assert.deepEqual(
+    proposal.edits.map((e) => e.file),
+    ["AGENTS.md"],
+  );
+  assert.equal(fs.existsSync(path.join(config.state.root, "synthesis", ".agents/skills/db/SKILL.md")), false);
+  const prompt = fs.readFileSync(path.join(config.state.root, "prompts/synthesis-edit.md"), "utf8");
+  assert.match(prompt, /This run targets `\.\/AGENTS\.md` only/);
+});
+
+test("a skill symlinked out of the repo is listed read-only, never offered as a writable path", async () => {
+  const { repo, config, run } = setup({
+    edit: { "AGENTS.md": { replace: [["- Keep this file short.\n", "- Keep this file short; point at files.\n"]] } },
+    annotations: [{ reply: { edits: [tighten(["H1"])] } }],
+  });
+  const library = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "backpass-synth-library-")));
+  fs.mkdirSync(path.join(library, "beads"));
+  fs.writeFileSync(
+    path.join(library, "beads", "SKILL.md"),
+    "---\nname: beads\ndescription: Load before tracking project work.\n---\n\n- Track it in beads.\n",
+  );
+  fs.mkdirSync(path.join(repo.root, ".agents/skills/db"), { recursive: true });
+  fs.writeFileSync(path.join(repo.root, ".agents/skills/db/SKILL.md"), DB_SKILL);
+  fs.symlinkSync(path.join(library, "beads"), path.join(repo.root, ".agents/skills/beads"));
+
+  const { violations } = await run();
+  assert.deepEqual(violations, []);
+
+  const prompt = fs.readFileSync(path.join(config.state.root, "prompts/synthesis-edit.md"), "utf8");
+  // Present with its token costs - the coverage signal has to survive - but declared
+  // read-only with the reason, so nothing invites an edit that would be discarded.
+  assert.match(
+    prompt,
+    /- beads \(\.agents\/skills\/beads\/SKILL\.md; \d+ tok body, \d+ tok description; read-only, resolves outside the repository\) :: Load before tracking project work\./,
+  );
+  assert.match(prompt, /skills marked `read-only` above are not in your staging copy/);
+  assert.match(
+    prompt,
+    /- db \(\.agents\/skills\/db\/SKILL\.md; \d+ tok body, \d+ tok description\) :: Load for database work\./,
+    "an in-repo skill is still writable and carries no marker",
+  );
+  assert.equal(fs.existsSync(path.join(config.state.root, "synthesis/.agents/skills/db/SKILL.md")), true);
+  assert.equal(fs.existsSync(path.join(config.state.root, "synthesis/.agents/skills/beads/SKILL.md")), false);
+});
+
+test("a skill target in an absolute in-repo skills directory is staged under its repo-relative path", async () => {
+  const targeted = setup({
+    edit: {
+      "custom-skills/db/SKILL.md": {
+        replace: [["Load for database work.", "Load before database work or SQL changes."]],
+      },
+    },
+    annotations: [{ reply: { edits: [tighten(["H1"])] } }],
+  });
+  const skillsDir = path.join(targeted.repo.root, "custom-skills");
+  fs.mkdirSync(path.join(skillsDir, "db"), { recursive: true });
+  fs.writeFileSync(path.join(skillsDir, "db/SKILL.md"), DB_SKILL);
+  fs.mkdirSync(path.join(skillsDir, "review"), { recursive: true });
+  fs.writeFileSync(
+    path.join(skillsDir, "review/SKILL.md"),
+    "---\nname: review\ndescription: Load for pull request review.\n---\n\n- Check the tests.\n",
+  );
+  targeted.config.skillsDir = skillsDir;
+  targeted.config.skillsDirs = [skillsDir];
+  targeted.config.target = { kind: "skill", path: "custom-skills/db/SKILL.md", name: "db" };
+
+  const { proposal, violations } = await targeted.run();
+  assert.deepEqual(violations, []);
+  assert.deepEqual(
+    proposal.edits.map((edit) => edit.file),
+    ["custom-skills/db/SKILL.md"],
+  );
+  const prompt = fs.readFileSync(path.join(targeted.config.state.root, "prompts/synthesis-edit.md"), "utf8");
+  assert.match(prompt, /review \(custom-skills\/review\/SKILL\.md;.*Load for pull request review\./);
+  assert.equal(fs.existsSync(path.join(targeted.config.state.root, "synthesis/custom-skills/review/SKILL.md")), false);
+});
+
+test("a skill target stages that skill alone; a staged write to AGENTS.md is refused, a direct one is caught by the fingerprint", async () => {
+  const target = { kind: "skill", path: ".agents/skills/db/SKILL.md", name: "db" };
+  const hijack = setup({
+    edit: {
+      ".agents/skills/db/SKILL.md": { replace: [["Keep transactions short.", "Keep every transaction short."]] },
+      "AGENTS.md": "# hijack\n",
+    },
+    annotations: [{ reply: { edits: [tighten(["H1", "H2"])] } }],
+  });
+  fs.mkdirSync(path.join(hijack.repo.root, ".agents/skills/db"), { recursive: true });
+  fs.writeFileSync(path.join(hijack.repo.root, ".agents/skills/db/SKILL.md"), DB_SKILL);
+  hijack.config.target = target;
+  await assert.rejects(hijack.run(), (err) => {
+    assert.ok(err instanceof ProposalViolation);
+    assert.match(err.violations.join("\n"), /targets \.agents\/skills\/db\/SKILL\.md only; AGENTS\.md is out of scope/);
+    return true;
+  });
+  assert.equal(fs.readFileSync(path.join(hijack.repo.root, "AGENTS.md"), "utf8"), AGENTS);
+  assert.equal(hijack.config.state.readProposal()?.edits.length, 0);
+  const direct = setup({ edit: {} });
+  fs.mkdirSync(path.join(direct.repo.root, ".agents/skills/db"), { recursive: true });
+  fs.writeFileSync(path.join(direct.repo.root, ".agents/skills/db/SKILL.md"), DB_SKILL);
+  direct.config.target = target;
+  fs.writeFileSync(
+    process.env.FAKE_ACPX_SCRIPT,
+    JSON.stringify({
+      edit: { [path.join(direct.repo.root, "AGENTS.md")]: { replace: [[TWO_ITEMS, ""]] } },
+      annotations: [{ reply: { edits: [] } }],
+    }),
+  );
+  await assert.rejects(direct.run(), /synthesis changed AGENTS\.md in the repository directly/);
+});
+
+test("an ordinary in-repo skill stays fingerprinted, whether or not the run narrows to it", async () => {
+  for (const target of [undefined, { kind: "memory", path: "AGENTS.md" }]) {
+    const guarded = setup({ edit: {} });
+    fs.mkdirSync(path.join(guarded.repo.root, ".agents/skills/db"), { recursive: true });
+    fs.writeFileSync(path.join(guarded.repo.root, ".agents/skills/db/SKILL.md"), DB_SKILL);
+    if (target) guarded.config.target = target;
+    fs.writeFileSync(
+      process.env.FAKE_ACPX_SCRIPT,
+      JSON.stringify({
+        edit: {
+          [path.join(guarded.repo.root, ".agents/skills/db/SKILL.md")]: {
+            replace: [["Keep transactions short.", "Keep every transaction short."]],
+          },
+        },
+        annotations: [{ reply: { edits: [] } }],
+      }),
+    );
+
+    await assert.rejects(guarded.run(), (err) => {
+      assert.ok(err instanceof UserError, `${target ? "targeted" : "surface"} run: ${err}`);
+      assert.match(err.message, /synthesis changed \.agents\/skills\/db\/SKILL\.md in the repository directly/);
+      return true;
+    });
+  }
+});
+
+test("a staged skill that resolves outside the repository is reported as such, not as a direct repo edit", async () => {
+  const outside = setup({ edit: {} }, { scope: { kind: "user" }, externalSkills: true });
+  const skillPath = path.join(outside.externalSkillsDir, "db/SKILL.md");
+  // User scope stages skills that live outside the repository, so they stay fingerprinted -
+  // writing through to one is exactly the betrayal this guard is for. But the file is not
+  // in the repository and the writer may have been another process, so the claim must not
+  // say it is.
+  fs.writeFileSync(
+    process.env.FAKE_ACPX_SCRIPT,
+    JSON.stringify({
+      edit: { [skillPath]: { replace: [["Keep transactions short.", "Keep every transaction short."]] } },
+      annotations: [{ reply: { edits: [] } }],
+    }),
+  );
+
+  await assert.rejects(outside.run(), (err) => {
+    assert.ok(err instanceof UserError);
+    assert.ok(
+      err.message.includes(`${skillPath} changed during synthesis; that path resolves outside the repository`),
+      err.message,
+    );
+    assert.doesNotMatch(err.message, /in the repository directly/);
+    assert.match(err.hint, /another process changed the shared library mid-run/);
+    return true;
+  });
+});
+
+test("a narrowed run does not fingerprint a skill linked into a store nothing may write", async () => {
+  const store = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "backpass-narrowed-store-")));
+  fs.mkdirSync(path.join(store, "db"));
+  const skill = "---\nname: db\ndescription: Load for database work.\n---\n\n- Keep transactions short.\n";
+  fs.writeFileSync(path.join(store, "db", "SKILL.md"), skill);
+
+  const narrowed = setup(
+    { edit: {}, annotations: [{ reply: { edits: [] } }] },
+    { scope: { kind: "user" }, externalSkills: true },
+  );
+  fs.rmSync(path.join(narrowed.externalSkillsDir, "db"), { recursive: true });
+  fs.symlinkSync(path.join(store, "db"), path.join(narrowed.externalSkillsDir, "db"));
+  fs.chmodSync(path.join(store, "db"), 0o555);
+  // Narrowing to the memory file stages no skill at all, but backpass has still guaranteed
+  // it will never write this one - so a home-manager rebuild touching it mid-run must not
+  // discard the memory-file work with a claim that the harness wrote to the repository.
+  narrowed.config.target = { kind: "memory", path: "AGENTS.md" };
+  fs.writeFileSync(
+    process.env.FAKE_ACPX_SCRIPT,
+    JSON.stringify({
+      edit: {
+        [path.join(store, "db", "SKILL.md")]: {
+          replace: [["Keep transactions short.", "Keep every transaction short."]],
+        },
+      },
+      annotations: [{ reply: { edits: [] } }],
+    }),
+  );
+
+  try {
+    const { violations } = await narrowed.run();
+    assert.deepEqual(violations, []);
+  } finally {
+    fs.chmodSync(path.join(store, "db"), 0o755);
+  }
+});
+
+test("a skill backpass withheld from staging is not fingerprinted, so a third party cannot abort the run", async () => {
+  const library = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "backpass-withheld-library-")));
+  fs.mkdirSync(path.join(library, "beads"));
+  const skill = "---\nname: beads\ndescription: Load before tracking project work.\n---\n\n- Track it.\n";
+  fs.writeFileSync(path.join(library, "beads", "SKILL.md"), skill);
+
+  const withheld = setup({ edit: {}, annotations: [{ reply: { edits: [] } }] });
+  fs.mkdirSync(path.join(withheld.repo.root, ".agents/skills"), { recursive: true });
+  fs.symlinkSync(path.join(library, "beads"), path.join(withheld.repo.root, ".agents/skills/beads"));
+  // Project scope never stages this skill, so backpass has guaranteed it will never write
+  // it; another process touching it mid-run must not discard the measured memory-file work.
+  fs.writeFileSync(
+    process.env.FAKE_ACPX_SCRIPT,
+    JSON.stringify({
+      edit: { [path.join(library, "beads", "SKILL.md")]: { replace: [["Track it.", "Track it in beads."]] } },
+      annotations: [{ reply: { edits: [] } }],
+    }),
+  );
+
+  const { violations } = await withheld.run();
+  assert.deepEqual(violations, []);
 });

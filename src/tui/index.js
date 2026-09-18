@@ -55,7 +55,9 @@ export function initialState(meta) {
       startedAt: null,
       endedAt: null,
       order: [],
-      harnesses: {},
+      harnesses: Object.create(null),
+      hostOrder: [],
+      hosts: Object.create(null),
       totalMatched: 0,
       storesOk: 0,
       storesTotal: 0,
@@ -171,6 +173,22 @@ export function reduceEvent(state, event, data, now = Date.now()) {
       d.totalMatched = Object.values(d.harnesses).reduce((sum, row) => sum + row.matched, 0);
       break;
     }
+    case "discover:host:start":
+      if (!d.hosts[data.host]) {
+        d.hostOrder.push(data.host);
+        d.hosts[data.host] = { status: "connecting", node: null, harnesses: {}, scanned: 0, error: null };
+      }
+      break;
+    case "discover:host:done": {
+      const h = d.hosts[data.host] || (d.hosts[data.host] = { harnesses: {} });
+      h.status = data.error ? "error" : "done";
+      h.error = data.error || null;
+      h.node = data.node || null;
+      h.harnesses = data.harnesses || {};
+      h.scanned = data.scanned || 0;
+      break;
+    }
+
     case "discover:done":
       d.status = "done";
       d.endedAt = now;

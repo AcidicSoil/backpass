@@ -4,6 +4,7 @@
 It serves the developer who owns that surface, whether it is a project's `AGENTS.md`, the `CLAUDE.md` Claude Code reads in its place, or user-level memory, and it turns transcripts already sitting on their disk into a small set of reviewable edits.
 By default the project file is the one it trains, because learned knowledge belongs with the repo it was learned in, and a write into a person's user-level file from a project run would pollute every project at once.
 A person's user-level surface (`~/.claude/CLAUDE.md`, user-level skills) is a target only when they name it as the scope of a run: that is still the human choosing which weights to train, and it is the only way a person who keeps their instructions at user level has a file to improve.
+A run may name one memory file or one skill instead of the whole surface; that is still the human naming the weights, and the run must not silently widen to the rest.
 Project-scoped and user-scoped evidence stay isolated, so one run cannot launder the other's corroboration.
 It owns exactly one thing: the backward pass from session transcripts to a proposed change in the named memory surface - the memory file and the skills loaded with it.
 
@@ -12,7 +13,8 @@ It owns exactly one thing: the backward pass from session transcripts to a propo
 Every claim a model makes carries a verbatim quote copied from the trace, and a claim without one is discarded rather than softened.
 A signal extracted mechanically, with no judgment applied to it, is noise until a quote anchors it to a real moment, so there is no quoteless path into the file.
 A visible violation outranks any number of "it went fine" observations, because negative evidence is what proves the file was steering anything at all.
-A new instruction needs corroboration from at least two distinct sessions, and one session never counts twice however often it is re-analyzed.
+Adding, rewording, or deleting instruction content needs corroboration from at least two distinct sessions, and one session never counts twice however often it is re-analyzed; extraction and movement are exempt because they preserve that content.
+That bar is drawn on sessions rather than on the shape of the change, because whether a reworded line carries new instruction is a question about meaning that no measurement of the text can settle.
 The bar is sessions, not repositories: a gap does not also have to appear in more than one project.
 Removing an instruction takes the same corroboration adding one does, and only harm from following it counts, because a rule that was merely skipped argues for reinforcement rather than deletion.
 Corroboration accumulates across runs in a ledger rather than resetting each run, so a gap seen today and again next week still graduates.
@@ -54,10 +56,10 @@ Growth of the memory file is never reported as progress.
 
 ## It reads what you already have and owns nothing
 
-Transcripts are read from local harness stores or local conversation exports the user explicitly selects, never uploaded, and they leave the machine only into an agent the user already authenticated.
+Transcripts are read from local harness stores, local conversation exports the user explicitly selects, or over SSH the person already trusts from their own other machines; they are never uploaded, and they leave the person's machines only into an agent the user already authenticated.
 `backpass` holds no API key of its own, so it can never become a bill or a service the user did not ask for.
 One machine is the default, not the limit: pooling corroboration across a person's machines, or across a team, is a change of scale and not a change of kind, because two independent observers hitting one gap is the strongest evidence there is.
-What may be shared is the derived evidence, carried by infrastructure the user already owns, never a transcript and never through anything `backpass` runs.
+Across people, what may be shared is the derived evidence, carried by infrastructure the user already owns, never a transcript and never through anything `backpass` runs.
 Redaction is a coarse net and says so, so a stricter check may warn or be offered but never blocks a run by default on a guess: a default refusal on unclassified high-entropy strings would reject most real sessions, and the predictable response is turning redaction off.
 All model invocation stays behind one module, so an upstream change has exactly one blast radius.
 An automatic source qualifies when it records real session transcripts, because a store holding only a model's summary of a session is not evidence; an imported source must likewise contain the real message transcript and be explicitly scoped by the user.

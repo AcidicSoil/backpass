@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { execOneShot, extractJson, sessionPrompt, usageRecord } from "./acpx.js";
+import { extractJson, runModelCall, usageRecord } from "./acpx.js";
 import { mergeGapEntries } from "./gap-ledger.js";
 import { renderPrompt } from "./prompts.js";
 import { warn } from "./logger.js";
@@ -63,7 +63,7 @@ function firstMistake(entry) {
  * Returns `{ merged, usage }`, `{ skipped }`, or `{ failed }` - never throws for a
  * model-side failure, because a run without consolidation is still a valid run.
  */
-export async function consolidateGapLedger({ ledger, memoryPath, config, repo }) {
+export async function consolidateGapLedger({ ledger, memoryPath, config, repo, modelCwd = null }) {
   const entries = Object.values(ledger.entries).filter((e) => e.memoryPath === memoryPath);
   if (entries.length < MIN_ENTRIES) return { skipped: "fewer than two open gaps" };
   if (!config.agents) return { skipped: "no agent resolver" };
@@ -82,16 +82,12 @@ export async function consolidateGapLedger({ ledger, memoryPath, config, repo })
         agent: pick.agent,
         model: pick.model,
         promptFile,
-        cwd: repo.root,
+        cwd: modelCwd || repo.root,
         timeoutSeconds: config.timeoutSeconds,
         promptRetries: config.promptRetries,
       };
-      if (!pick.effort) return execOneShot(call);
-      callCounter += 1;
-      return sessionPrompt({
-        ...call,
-        effort: pick.effort,
-        sessionName: `backpass-consolidate-${process.pid}-${callCounter}`,
+      return runModelCall(call, pick, {
+        sessionName: () => `backpass-consolidate-${process.pid}-${++callCounter}`,
       });
     });
   } catch (err) {

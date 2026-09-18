@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
+import { UserError } from "./logger.js";
 import { estimateTokens } from "./tokens.js";
 
 /**
@@ -21,9 +22,34 @@ import { estimateTokens } from "./tokens.js";
 
 export const BROAD_RELEVANCE_THRESHOLD = 0.2;
 
+export function logicalSkillDir(repoRoot, skillsDir) {
+  const absolute = path.isAbsolute(skillsDir) ? skillsDir : path.resolve(repoRoot, skillsDir);
+  const relative = path.relative(path.resolve(repoRoot), absolute);
+  if (relative === "") return ".";
+  if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return absolute;
+  return relative.split(path.sep).join("/");
+}
+
+/**
+ * True when a directory entry is a directory once symlinks are followed. A broken or
+ * cyclic link is not, and never throws.
+ *
+ * @param {string} root
+ * @param {import("node:fs").Dirent} entry
+ */
+export function isDirectoryEntry(root, entry) {
+  if (entry.isDirectory()) return true;
+  if (!entry.isSymbolicLink()) return false;
+  try {
+    return fs.statSync(path.join(root, entry.name)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 /** Read the existing skills so synthesis can tune a description instead of duplicating it. */
 export function loadSkills(repoRoot, skillsDir) {
-  const root = path.join(repoRoot, skillsDir);
+  const root = path.isAbsolute(skillsDir) ? skillsDir : path.join(repoRoot, skillsDir);
   if (!fs.existsSync(root)) return [];
 
   const skills = [];
@@ -35,7 +61,11 @@ export function loadSkills(repoRoot, skillsDir) {
   }
 
   for (const entry of entries) {
-    const file = entry.isDirectory()
+    // A harness loads what the path resolves to, so a symlinked skill directory is a skill.
+    // `readdir` reports the link itself, never its target, so the type has to be stat'd -
+    // otherwise a library-plus-symlinks layout (the common way to share skills across
+    // harnesses) is invisible here and its always-loaded descriptions go unbilled.
+    const file = isDirectoryEntry(root, entry)
       ? path.join(root, entry.name, "SKILL.md")
       : entry.name.endsWith(".md")
         ? path.join(root, entry.name)
@@ -51,27 +81,38 @@ export function loadSkills(repoRoot, skillsDir) {
     skills.push({
       name: frontmatter.name || entry.name.replace(/\.md$/, ""),
       description: frontmatter.description || "",
-      path: path.relative(repoRoot, file),
+      path: (() => {
+        const relative = path.relative(repoRoot, file);
+        return relative.startsWith("..") || path.isAbsolute(relative) ? file : relative.split(path.sep).join("/");
+      })(),
       body: skillBody(text),
       bodyTokens: estimateTokens(text),
       descriptionTokens: estimateTokens(frontmatter.description || ""),
     });
   }
 
-  return skills.sort((a, b) => a.name.localeCompare(b.name));
+  return skills.sort((a, b) => a.name.localeCompare(b.name) || a.path.localeCompare(b.path));
 }
 
 /**
- * Every project-level skill root a supported harness can load. The overflow target is
- * included even when custom-configured, and roots resolving to the same directory (the
- * normal `.claude/skills` symlink) are counted only once.
+ * Resolve supported skill roots without double-counting directories reached by symlink.
+ * Project scope includes the conventional roots; exact mode uses only the configured
+ * harness roots and overflow target.
  */
-export function resolveProjectSkillDirs(repoRoot, overflowDir = CANONICAL_SKILLS_DIR) {
+export function resolveProjectSkillDirs(
+  repoRoot,
+  overflowDir = CANONICAL_SKILLS_DIR,
+  extraDirs = [],
+  { exact = false } = {},
+) {
   const dirs = [];
   const seen = new Set();
-  for (const dir of [overflowDir, CANONICAL_SKILLS_DIR, CLAUDE_SKILLS_LINK]) {
+  const candidates = exact
+    ? [overflowDir, ...extraDirs]
+    : [overflowDir, CANONICAL_SKILLS_DIR, CLAUDE_SKILLS_LINK, ...extraDirs];
+  for (const dir of candidates) {
     if (!dir) continue;
-    const absolute = path.join(repoRoot, dir);
+    const absolute = path.isAbsolute(dir) ? dir : path.join(repoRoot, dir);
     const exists = fs.existsSync(absolute);
     if (!exists && dir !== overflowDir) continue;
     let identity = path.resolve(absolute);
@@ -84,14 +125,14 @@ export function resolveProjectSkillDirs(repoRoot, overflowDir = CANONICAL_SKILLS
     }
     if (seen.has(identity)) continue;
     seen.add(identity);
-    dirs.push(dir);
+    dirs.push(logicalSkillDir(repoRoot, dir));
   }
   return dirs;
 }
 
 /** Load generated and human-authored project skills across every supported root. */
-export function loadProjectSkills(repoRoot, overflowDir = CANONICAL_SKILLS_DIR) {
-  return resolveProjectSkillDirs(repoRoot, overflowDir)
+export function loadProjectSkills(repoRoot, overflowDir = CANONICAL_SKILLS_DIR, extraDirs = [], options = {}) {
+  return resolveProjectSkillDirs(repoRoot, overflowDir, extraDirs, options)
     .flatMap((dir) => loadSkills(repoRoot, dir))
     .sort((a, b) => a.name.localeCompare(b.name) || a.path.localeCompare(b.path));
 }
@@ -109,6 +150,24 @@ export function skillBody(text) {
  */
 export function skillDescriptionTokens(skills) {
   return (skills || []).reduce((sum, s) => sum + (s.descriptionTokens ?? estimateTokens(s.description || "")), 0);
+}
+
+/**
+ * How many loaded entries are the same file as `file`. One library reached through k links
+ * is loaded k times and billed k times (`skillDescriptionTokens` sums every entry), so a
+ * change to its description line costs k times that delta on the always-loaded surface.
+ */
+export function loadedCopies(repoRoot, skills, file) {
+  const identity = (p) => {
+    try {
+      return fs.realpathSync(path.isAbsolute(p) ? p : path.join(repoRoot, p));
+    } catch {
+      return null;
+    }
+  };
+  const target = identity(file);
+  if (!target) return 1;
+  return Math.max(1, (skills || []).filter((skill) => identity(skill.path) === target).length);
 }
 
 /** Minimal YAML frontmatter reader for plain values and `>` / `|` multi-line values. */
@@ -180,7 +239,9 @@ export function renderSkillIndex(skills) {
   return skills
     .map(
       (s) =>
-        `- ${s.name} (${s.bodyTokens} tok body, ${s.descriptionTokens} tok description) :: ${s.description || "(no description)"}`,
+        `- ${s.name} (${s.path}; ${s.bodyTokens} tok body, ${s.descriptionTokens} tok description` +
+        `${s.readOnly ? `; read-only, ${s.readOnly}` : ""})` +
+        ` :: ${s.description || "(no description)"}`,
     )
     .join("\n");
 }
@@ -253,41 +314,87 @@ export const CANONICAL_SKILLS_DIR = ".agents/skills";
 export const CLAUDE_SKILLS_LINK = ".claude/skills";
 export const CLAUDE_SKILLS_LINK_TARGET = path.posix.join("..", CANONICAL_SKILLS_DIR);
 
+export function normalizeSkillsDir(skillsDir) {
+  if (typeof skillsDir !== "string" || !skillsDir.trim()) {
+    throw new UserError("config.skillsDir must be a non-empty path string");
+  }
+  const normalized = skillsDir.replaceAll("\\", "/");
+  const withoutTrailingSlashes = normalized.replace(/\/+$/, "");
+  const volumeRoot = /^([A-Za-z]:)\/+$/u.exec(normalized);
+  const result = volumeRoot ? `${volumeRoot[1]}/` : withoutTrailingSlashes;
+  if (!result) throw new UserError("config.skillsDir must be a non-empty path string");
+  return result;
+}
+
 /**
  * Pick the directory skill extractions target.
  *
  * Skills only pay off if the harness loads them, so the answer is the canonical
  * `.agents/skills` (mirrored to `.claude/skills` by symlink) unless the user explicitly
- * configured another directory that already exists. The bare `skills/` dir is an
- * installer/public convention that no harness auto-loads, so it is never auto-detected -
- * it is only honored when named in the config. Resolution is read-only; the layout is
- * created at write time (`ensureSkillsLayout`), which keeps every pre-apply stage
+ * configured an existing harness-loaded directory, including `.claude/skills`. The bare
+ * `skills/` dir is an installer/public convention that no harness auto-loads, so it is
+ * never auto-detected - it is only honored when named in the config. Resolution is
+ * read-only; the layout is created at write time (`ensureSkillsLayout`), which keeps every pre-apply stage
  * side-effect free.
  */
-export function resolveOverflowTarget(repoRoot, skillsDir = CANONICAL_SKILLS_DIR) {
+export function resolveOverflowTarget(
+  repoRoot,
+  skillsDir = CANONICAL_SKILLS_DIR,
+  { claudeSkillsDir = CLAUDE_SKILLS_LINK, allowExternal = false } = {},
+) {
+  const configuredDir = normalizeSkillsDir(skillsDir);
   const warnings = [];
-  const claude = inspectClaudeSkillsLink(repoRoot);
-  if (claude.state === "dir") warnings.push(claudeSkillsDirWarning());
-
-  const explicit = skillsDir && skillsDir !== CANONICAL_SKILLS_DIR && skillsDir !== CLAUDE_SKILLS_LINK;
-  if (explicit && fs.existsSync(path.join(repoRoot, skillsDir))) {
-    return { kind: "skills", dir: skillsDir, warnings };
-  }
-  return { kind: "skills", dir: CANONICAL_SKILLS_DIR, warnings };
+  const canonical = path.join(repoRoot, CANONICAL_SKILLS_DIR);
+  const claudeLink = path.isAbsolute(claudeSkillsDir) ? claudeSkillsDir : path.join(repoRoot, claudeSkillsDir);
+  const target = path.relative(path.dirname(claudeLink), canonical) || ".";
+  const claude = inspectClaudeSkillsLink(repoRoot, claudeSkillsDir);
+  const explicit = configuredDir && configuredDir !== CANONICAL_SKILLS_DIR;
+  const resolvedSkillsDir = path.isAbsolute(configuredDir) ? configuredDir : path.join(repoRoot, configuredDir);
+  if (explicit && !allowExternal) assertSkillsDirInsideRepo(repoRoot, configuredDir, resolvedSkillsDir);
+  const dir =
+    explicit && fs.existsSync(resolvedSkillsDir) ? logicalSkillDir(repoRoot, configuredDir) : CANONICAL_SKILLS_DIR;
+  if (claude.state === "dir" && dir === CANONICAL_SKILLS_DIR)
+    warnings.push(claudeSkillsDirWarning(claudeSkillsDir, target));
+  return { kind: "skills", dir, warnings };
 }
 
-function claudeSkillsDirWarning() {
-  return (
-    `${CLAUDE_SKILLS_LINK} is a real directory, not a symlink to ${CLAUDE_SKILLS_LINK_TARGET}; ` +
-    `left untouched. Claude will not see skills written to ${CANONICAL_SKILLS_DIR} until you ` +
-    `merge it in and replace it with the symlink (ln -s ${CLAUDE_SKILLS_LINK_TARGET} ${CLAUDE_SKILLS_LINK}).`
+function assertSkillsDirInsideRepo(repoRoot, configuredDir, resolvedSkillsDir) {
+  const root = path.resolve(repoRoot);
+  if (!isPathInside(root, path.resolve(resolvedSkillsDir))) throw invalidSkillsDir(configuredDir);
+  if (!fs.existsSync(resolvedSkillsDir)) return;
+
+  try {
+    if (!isPathInside(fs.realpathSync(root), fs.realpathSync(resolvedSkillsDir))) throw invalidSkillsDir(configuredDir);
+  } catch (err) {
+    if (err instanceof UserError) throw err;
+  }
+}
+
+function isPathInside(root, target) {
+  const relative = path.relative(root, target);
+  return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+}
+
+function invalidSkillsDir(configuredDir) {
+  return new UserError(
+    `config.skillsDir "${configuredDir}" must resolve inside the repository`,
+    "use a skills directory inside the project, such as .claude/skills",
   );
 }
 
-function inspectClaudeSkillsLink(repoRoot) {
+function claudeSkillsDirWarning(claudeSkillsDir = CLAUDE_SKILLS_LINK, target = CLAUDE_SKILLS_LINK_TARGET) {
+  return (
+    `${claudeSkillsDir} is a real directory, not a symlink to ${target}; ` +
+    `left untouched. Claude will not see skills written to ${CANONICAL_SKILLS_DIR} until you ` +
+    `merge it in and replace it with the symlink (ln -s ${target} ${claudeSkillsDir}).`
+  );
+}
+
+function inspectClaudeSkillsLink(repoRoot, claudeSkillsDir = CLAUDE_SKILLS_LINK) {
+  const link = path.isAbsolute(claudeSkillsDir) ? claudeSkillsDir : path.join(repoRoot, claudeSkillsDir);
   let stat;
   try {
-    stat = fs.lstatSync(path.join(repoRoot, CLAUDE_SKILLS_LINK));
+    stat = fs.lstatSync(link);
   } catch {
     return { state: "missing" };
   }
@@ -406,7 +513,7 @@ export function removeOwnedSkillPaths(paths) {
  * `.claude/skills` is never clobbered: a symlink (to anywhere) is left as is, and a real
  * directory is reported so the user can merge it by hand.
  */
-export function ensureSkillsLayout(repoRoot) {
+export function ensureSkillsLayout(repoRoot, claudeSkillsDir = CLAUDE_SKILLS_LINK) {
   const created = [];
   const warnings = [];
   const canonical = path.join(repoRoot, CANONICAL_SKILLS_DIR);
@@ -415,14 +522,15 @@ export function ensureSkillsLayout(repoRoot) {
     created.push(CANONICAL_SKILLS_DIR);
   }
 
-  const claude = inspectClaudeSkillsLink(repoRoot);
+  const link = path.isAbsolute(claudeSkillsDir) ? claudeSkillsDir : path.join(repoRoot, claudeSkillsDir);
+  const target = path.relative(path.dirname(link), canonical) || ".";
+  const claude = inspectClaudeSkillsLink(repoRoot, claudeSkillsDir);
   if (claude.state === "missing") {
-    const link = path.join(repoRoot, CLAUDE_SKILLS_LINK);
     fs.mkdirSync(path.dirname(link), { recursive: true });
-    fs.symlinkSync(CLAUDE_SKILLS_LINK_TARGET, link, "dir");
-    created.push(`${CLAUDE_SKILLS_LINK} -> ${CLAUDE_SKILLS_LINK_TARGET}`);
+    fs.symlinkSync(target, link, "dir");
+    created.push(`${claudeSkillsDir} -> ${target}`);
   } else if (claude.state === "dir") {
-    warnings.push(claudeSkillsDirWarning());
+    warnings.push(claudeSkillsDirWarning(claudeSkillsDir, target));
   }
   return { created, warnings };
 }
@@ -432,7 +540,7 @@ export function writeSkill(repoRoot, skill, { exclusive = false, ensureLayout = 
   const inCanonical = skill.path === CANONICAL_SKILLS_DIR || skill.path.startsWith(`${CANONICAL_SKILLS_DIR}/`);
   const layout = inCanonical && ensureLayout ? ensureSkillsLayout(repoRoot) : { created: [], warnings: [] };
   const canonicalWasMissing = inCanonical && !fs.existsSync(path.join(repoRoot, CANONICAL_SKILLS_DIR));
-  const target = path.join(repoRoot, skill.path);
+  const target = path.isAbsolute(skill.path) ? skill.path : path.join(repoRoot, skill.path);
   fs.mkdirSync(path.dirname(target), { recursive: true });
   if (!ensureLayout && canonicalWasMissing) layout.created.push(CANONICAL_SKILLS_DIR);
   const text = renderSkillFile(skill);

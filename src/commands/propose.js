@@ -9,10 +9,11 @@ import { budgetBar, formatTokens } from "../tokens.js";
 import { emitProgress } from "../progress.js";
 import { primaryMemoryFile } from "./analyze.js";
 import { printUsage } from "./usage.js";
-import { discoverForRun } from "./scan.js";
+import { closeRemoteDiscovery, discoverForRun } from "./scan.js";
 import { capTranscripts } from "../sample.js";
 import { isEvidenceFresh } from "../state.js";
 import { transcriptIdentity } from "../transcript.js";
+import { pruneHostCache } from "../discovery/cache.js";
 
 /**
  * Fold on-disk evidence for the memory surface. Gap sightings persist across runs, but
@@ -71,6 +72,7 @@ export async function foldForRun(ctx, memoryFile, memoryHash, skills = [], trans
     memoryPath: memoryFile.path,
     config: ctx.config,
     repo: ctx.repo,
+    modelCwd: ctx.scope?.modelCwd || ctx.repo?.root,
   });
   pruneGapLedger(ledger, { memoryFile, memoryPath: memoryFile.path, skills, maxAge: gapLedgerMaxAge });
   state.writeGapLedger(ledger);
@@ -80,6 +82,8 @@ export async function foldForRun(ctx, memoryFile, memoryHash, skills = [], trans
   );
   const summary = foldEvidence(relevant, {
     minGapEvidence,
+    minGapProjects: ctx.scope?.kind === "user" ? ctx.config.minGapProjects || 1 : 0,
+    checkProjectCoverage: ctx.scope?.kind === "user",
     memoryFile,
     gapObservations,
     skills,
@@ -95,12 +99,21 @@ export function accountForConsolidationUsage(proposal, summary) {
 }
 
 export async function runProposal(ctx, precomputed = null) {
+  try {
+    return await runProposalCore(ctx, precomputed);
+  } finally {
+    await closeRemoteDiscovery(ctx);
+    pruneHostCache(ctx.config.state.root);
+  }
+}
+
+async function runProposalCore(ctx, precomputed) {
   const { repo, config } = ctx;
   // Starting a new proposal run invalidates the previous result immediately. Discovery,
   // folding, and agent resolution can all fail before synthesis starts; none of those
   // failures may leave an older proposal available to apply as if it came from this run.
   config.state.clearProposal();
-  const { file, hash, skills } = precomputed || primaryMemoryFile(repo, config);
+  const { file, hash, skills } = precomputed || primaryMemoryFile(repo, config, ctx.scope);
   const transcripts = precomputed?.transcripts || capTranscripts(await discoverForRun(ctx), config).transcripts;
 
   const foldStarted = Date.now();
@@ -128,6 +141,7 @@ export async function runProposal(ctx, precomputed = null) {
     config,
     repo,
     transcripts,
+    scope: ctx.scope,
   });
 
   accountForConsolidationUsage(proposal, summary);
@@ -169,7 +183,11 @@ export function printProposal(proposal, { applied = false, analysisUsage = [] } 
     const delta = edit.deltaTokens || 0;
     out(
       `  ${color.cyan(edit.id)} ${kind.padEnd(8)} ${edit.title} ` +
-        color.dim(`(${delta > 0 ? "+" : ""}${delta} tok, ${edit.transcripts} transcript(s))`),
+        color.dim(
+          `(${delta > 0 ? "+" : ""}${delta} tok, ${edit.transcripts} transcript(s)` +
+            (edit.projects != null ? `, projects=${edit.projects}` : "") +
+            `)`,
+        ),
     );
   }
 
@@ -201,6 +219,9 @@ export function synthesisFailureHint(err) {
   }
   if (err.reason === "editing") {
     return "the agent kept rewriting the staging copy instead of describing it; run `backpass propose` again to start fresh";
+  }
+  if (err.reason === "edit-empty") {
+    return "the edit turn made no changes to the staging copy, so there was nothing for the annotation turn to describe; run `backpass propose` again, or pin a different harness with --synthesis-agent";
   }
   const violations = err.violations || [];
   if (violations.some(isBudgetViolation)) {

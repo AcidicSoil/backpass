@@ -38,6 +38,48 @@ user explicitly attaches, analyzes them, and proposes evidence-backed edits to `
 
 ## Sharp edges
 
+- **User-scope runs are a separate triple.** See README's User-level memory section
+  for user-facing paths and defaults. Association, filters, and the synthetic homedir
+  repo live in `src/scope.js`; user state never enters `<repo>/.backpass/`.
+  `minGapProjects` defaults to 1 (the gate exists; cross-project corroboration is not
+  required). A project-scoped run never writes a user-level file.
+- **`--target` is a write surface, not a second scope or a second budget.** `resolveTarget`
+  in `src/target.js` accepts only an exact configured memory-file entry or an exact loaded
+  skill name; every other spelling errors with the valid names - never add a basename,
+  directory, path, or glob match. A skill target keeps the primary memory file as the file
+  under audit, so analysis, evidence, hashes, and the always-loaded budget are unchanged;
+  only staging (`stagedSkills` in `prepareWorkspace`) and the `buildProposal` gate narrow.
+  `TARGET_COMMANDS` lists where the flag applies; everything else rejects it.
+- **SSH hosts are a collection tier, not a second scope.** `src/discovery/hosts.js` runs
+  three remote commands per configured host - locate Node/git, probe `discover`, probe
+  `fetch` - over one explicit ControlMaster that is opened before locate and closed after
+  fetch or at command teardown; the descriptors join the one corpus with the same tiers, sample and
+  cap. `src/discovery/remote/ssh.js` is the sole ssh spawn boundary (constant option set,
+  destination/node-path refusal, `classifySshFailure`, `BACKPASS_SSH_BIN`), and a Windows
+  shim refusal must be raised by name there like every other spawn. Nothing installs on
+  the remote: `src/discovery/remote/bundle.js` ships `PROBE_MANIFEST` plus the request as
+  one stdin program, so a stray import in a manifest module breaks every host at once -
+  `test/remote-bundle.test.js` runs the probe from a directory holding only the manifest.
+  The payload never reaches the remote shell; the refused node path is the only variable
+  command text and is single-quoted. The locate snippet and loader bodies carry no single
+  quote, backslash, or `!`. Remote tiers have no tier 1
+  (nothing over there is this clone); facts come from `remote/git-facts.js`, computed
+  where the paths are real, and `associateRemote` applies the local rules to them. Hosts
+  are personal configuration: `discovery.hosts` in `.backpassrc.json` is a `UserError` by
+  construction, which is what keeps the feature inside VISION's "never someone else's
+  transcripts". Every host is fail-soft with a named message; host keys are never
+  auto-accepted and `StrictHostKeyChecking=no` is never suggested.
+- **A remote session's content is fetched, cached, and read through the same adapter.**
+  `prefetchRemoteTranscripts` runs before the analysis pool for exactly the pending
+  sampled transcripts. File-backed stores send the raw file so `rawPath` still names a
+  real local file and the analysis escape hatch survives the trip; SQLite stores send the
+  adapter's events, since there is no per-session file. `src/discovery/cache.js` hashes
+  (host, harness, key) into a name so an untrusted remote path can never steer a write,
+  writes tmp+rename, and prunes at 30 days unused. A short frame fails that one transcript
+  with `remote fetch incomplete` and refetches next run - never a truncated session
+  analyzed as a whole one. Identity is `ssh://<host>/<path>` (`transcriptSource`), evidence
+  labels carry the host (`gapSource`), and one session present on two machines is kept
+  once, local copy first.
 - **Sibling clones are a live-path tier, not a recorded-remote one.** `git worktree
 list` only sees this clone. `attachSiblingClones` in `src/repo.js` also searches the
   parent of each worktree (and `discovery.cloneRoots`) for other checkouts that share a
@@ -89,8 +131,12 @@ list` only sees this clone. `attachSiblingClones` in `src/repo.js` also searches
   every non-memory edit target still hashes to its `proposal.targetFiles` entry (same
   contract, so a hand-edited skill refuses the apply instead of being patched blind), the
   accepted subset clears `budgetGateKind` (`src/tokens.js`), every accepted edit for a file
-  composes against that file's one pre-write image, and every created skill target is still
-  absent. Any of them failing writes nothing and records no rejection. Accepted paths are
+  composes against that file's one pre-write image, every created skill target is still
+  absent, and, when the proposal carries any skill writes, the current run's resolved
+  `skillsDir` (defaulting to the canonical skills dir when unset) still matches
+  `proposal.config.skillsDir` - a mismatch refuses the apply naming both values rather than
+  writing to the stale propose-time path. Any of them failing writes nothing and records no
+  rejection. Accepted paths are
   resolved before mutation, and duplicate resolved targets refuse the whole apply. Each file
   is therefore applied whole or not at all. Skills and non-memory files land before the
   memory file; a later failure rolls back files, skills, and loading-layout entries created
@@ -106,7 +152,11 @@ list` only sees this clone. `attachSiblingClones` in `src/repo.js` also searches
   file, widened until unique, so a hunk can only go stale by the file itself changing after
   the proposal, which apply refuses rather than part-applies. Never pass
   `approveAll` with the repo as `cwd`; the repo is fingerprinted and a harness that
-  writes there fails the run loudly.
+  writes there fails the run loudly. Staging withholds a loaded skill it could never write -
+  one resolving outside the repository, or into a location nothing may write - naming the
+  reason in the skill index, and the fingerprint follows staging: a withheld file is one
+  backpass has guaranteed it will never write, so a third party's edit to it must not abort
+  the run. Staging and the fingerprint must stay in step.
 - **Annotate-loop outcomes stay distinct** (`annotateLoop` in `src/synthesize.js`): a
   moved staging tree is re-measured without spending an `ANNOTATE_TURNS` attempt (bounded
   by `REMEASURE_TURNS`); no adapter text is retried once in a new session; and only a
@@ -118,7 +168,15 @@ list` only sees this clone. `attachSiblingClones` in `src/repo.js` also searches
   call, so an empty-only failure cannot leave an older proposal applicable.
   `synthesisFailureHint` in `src/commands/propose.js` is
   where the advice for each terminal condition lives - never a blanket
-  stronger-model/budget/max-edits line.
+  stronger-model/budget/max-edits line. A blank or unparseable first annotate turn is
+  reported as `edit-empty`, not the generic `empty`/`unparseable` reason, when the edit
+  turn left the staging copy and all in-scope files byte-identical to the original - a
+  stray out-of-scope write counts as touched, so it is never hidden behind `edit-empty` -
+  there was nothing to annotate, so retrying burns no attempts. That check only fires on the loop's first turn;
+  a later turn's empty diff still means the model undid its own edit mid-annotation, which
+  stays `editing`/`empty`/`unparseable`. It never overrides a _parseable_ answer, even
+  `{edits: []}`, because an agent that changed nothing yielding an empty proposal is a
+  success, not a failure (`VISION.md`).
 - **An extract is one measured memory change plus the skill(s) it pays for.** `anchoredHunks`
   merges adjacent removals, so extracting neighbouring sections yields one change and N
   skills - one honest accept/reject decision, since a merged change cannot be
@@ -144,14 +202,42 @@ list` only sees this clone. `attachSiblingClones` in `src/repo.js` also searches
   pure deletion inside a skill file is refused outright - skill content is rewritten or
   extracted, never dropped. Non-compliance never satisfies the floor; the >= 20%-relevance
   placement table stays prompt guidance by the captain's explicit decision - do not harden it.
+- **One session floor covers the whole always-loaded surface.** Every edit whose kind is
+  not `extract` or `move` must quote `minGapEvidence` distinct sessions - add, rewrite and
+  remove alike. `buildProposal` discards empty quote text, then counts canonical non-empty
+  source labels from the edit's own `evidence` that also appear in `summary.sources`
+  (the labels this run's fold issued; `gapSource` / `disambiguateSourceLabels` in
+  `src/gap-ledger.js`, folded in `src/fold.js`). Labels must remain one-to-one with
+  canonical sessions; `test/proposal.test.js` covers the evidence-floor contract. The
+  model's `transcripts` field is not read. A misspelled or date-shifted label is not a second session. Sourceless quotes
+  remain visible as `unknown source` but do not count. There is no shape predicate
+  separating an additive rewrite from a tightening, so a one-session tightening is
+  refused too. Never reintroduce a lexical-overlap, token-growth, or other text classifier
+  here. In user scope the same edits also clear `minGapProjects` (unchanged default),
+  counted by `countedEvidenceProjects` from cited gap clusters and from
+  `summary.sourceProjects`, the fold's source -> project map that lets instruction-row
+  evidence answer for a rewrite. Keep that map keyed by the same unique labels.
+  `sourceProjects` is empty without a project;
+  `summary.sources` is the allowlist for both scopes.
 - **Negative evidence has a sign the pipeline must not lose.** Analysis classifies every
   negative (`harm` / `non-compliance` / `irrelevant`, `sanitizeEvidence` drops other
   values) and `renderEvidenceForPrompt` renders the class AND the `effect` text with each
   quote. Records from before the class existed carry none, and none never counts as harm.
-- **Skills only count if a harness loads them.** Extractions target `.agents/skills` with
-  `.claude/skills -> ../.agents/skills` as a symlink (`ensureSkillsLayout` in
-  `src/skills.js`, run at write time); a bare `skills/` dir is never auto-detected and a
-  real `.claude/skills` directory is warned about, never replaced.
+- **A quote must be findable in the trace it claims to come from.** `sanitizeEvidence`
+  (`src/analyze.js`) drops any evidence item whose quote is not a whitespace-folded
+  substring of the distilled trace, counting the drops into `summary.quotesNotInTrace` so a
+  paraphrasing model reads as that rather than as a clean repo. Only the literal boolean
+  `usedRawTranscript === true` opts out, because then the quote may come from text the
+  distiller elided. Consequence for tests: a fake agent must quote real text from the
+  session it analyzes - invented quotes are exactly what the gate rejects. Analysis
+  semantics changed, so `ANALYSIS_INDEX_VERSION` (`src/state.js`) was bumped; bump it again
+  for any future change to what analysis accepts.
+- **Skill target/load-layout rules live in `src/skills.js`.** Preserve an existing configured
+  harness-loaded directory; a bare `skills/` directory is never auto-detected. A harness loads
+  what a path resolves to, so a symlinked directory under the loaded dir is a skill: entry types
+  are stat'd (`isDirectoryEntry`), fail-soft, and a broken or cyclic link reads as absent. One
+  library reached through k links is k loaded entries, billed k times - `loadedCopies` multiplies
+  a description-line delta by that count in both `buildProposal` and the writer's projection.
 - **Memory resolution is pointer-aware** (`resolveMemoryFiles` in `src/memory.js`): the
   first configured file is canonical, a `@AGENTS.md`-only CLAUDE.md is a pointer, and a
   second full file is warned about, never silently ignored or double-written.
@@ -162,8 +248,16 @@ list` only sees this clone. `attachSiblingClones` in `src/repo.js` also searches
   unsplit. The instruction index and fold use those parts so evidence cannot smear across a
   blob, and synthesis is told to restructure repeated non-compliance into list items rather
   than bold-label it. See `src/memory.js` and `renderEvidenceForPrompt` in `src/fold.js`.
-- **Never trust model-reported numbers.** Token deltas and budget projections are measured
-  in `src/proposal.js` from the actual text; the synthesis model's own figures are ignored.
+- **The apply surface's funnel band is presentation, and its counters must stay that way.**
+  `templates/apply.html` draws one band from findings to edits proposed on one scale, in two
+  lanes (an existing instruction, a missing one), each drop named in plain words. It is fed by
+  display-only counters - `reportOnlyByReason` and `instructionsWithNegatives` in the fold's
+  `totals`, plus the instruction-outcome counters in `buildProposal` - that no gate may ever
+  read; changing what the band shows must never change what is proposed or refused.
+  A proposal lacking them falls back to the classic stat row rather than inventing zeros.
+- **Never trust model-reported numbers.** Token deltas, budget projections and an edit's
+  session count are measured in `src/proposal.js` from the actual text and quotes; the
+  synthesis model's own figures are ignored.
   Usage accounting comes from acpx's `[acpx] tokens:` stderr line, which acpx prints
   when the ACP adapter returns usage (codex, claude do; pi-acp does not), with one
   harness-store fallback: pi's per-turn usage is read back from its own session file,
@@ -245,6 +339,15 @@ list` only sees this clone. `attachSiblingClones` in `src/repo.js` also searches
   CLI change has one blast radius. v1 uses plain `exec` and named sessions only; acpx flows
   are deferred until they are stable upstream. The one sanctioned exception is the
   per-harness native status table in `src/agents.js` (`claude auth status`, `opencode models`).
+  Grok overlays ride acpx `--agent`; that hatch has no `-s` of its own (acpx 0.13.x:
+  `unknown option '-s'`), so `openSession`'s `prompt()` sends the `prompt` subcommand
+  before `-s` when `acpxAgentCommand` is set. Built-in agents keep the implicit form.
+- **Only acpx session creation gets the adapter cold-start budget.** Built-in adapters may
+  launch through a package-exec bridge, so `sessions new` uses
+  `SESSION_CREATE_TIMEOUT_MS`; probe status/close retain `PROBE_TIMEOUT_MS` (including its
+  per-agent override), and open sessions keep their shorter post-create limits. Handle
+  `result.timedOut` before generic non-zero exits so a stalled create is never reported as
+  missing session support. `test/acpx-session-create-timeout.test.js` covers both contracts.
 - **Model and effort overrides are invocation-scoped.** Never ACP `set model` / Pi
   `set thought_level` (those rewrite `~/.pi/agent/settings.json`) and never edit-then-restore
   harness defaults. `src/harness-invoke.js` owns the harness overlay mechanisms and

@@ -2,13 +2,16 @@ import { analyzeTranscripts } from "../analyze.js";
 import { applyDecisions, writeBootstrapFiles } from "../apply/writer.js";
 import { bootstrapTargets, renderPointer, starterMemoryFile } from "../bootstrap.js";
 import { UserError, color, info, json, out, warn } from "../logger.js";
+import { formatFailureLine } from "./apply.js";
 import { resolveMemoryFiles } from "../memory.js";
 import { emitProgress } from "../progress.js";
 import { ProposalViolation } from "../proposal.js";
 import { capTranscripts } from "../sample.js";
 import { synthesizeProposal } from "../synthesize.js";
 import { budgetBar, formatTokens } from "../tokens.js";
-import { discoverForRun } from "./scan.js";
+import { closeRemoteDiscovery, discoverForRun } from "./scan.js";
+import { prefetchRemoteTranscripts } from "../discovery/hosts.js";
+import { pruneHostCache } from "../discovery/cache.js";
 import { accountForConsolidationUsage, foldForRun, printProposal } from "./propose.js";
 
 /**
@@ -38,11 +41,21 @@ const BOOTSTRAP_RUN_NOTE =
  * default to the real pipeline and can be swapped for fakes.
  */
 export async function bootstrapRun(ctx, deps = {}) {
+  try {
+    return await bootstrapRunCore(ctx, deps);
+  } finally {
+    await closeRemoteDiscovery(ctx);
+    pruneHostCache(ctx.config.state.root);
+  }
+}
+
+async function bootstrapRunCore(ctx, deps) {
   const { repo, config } = ctx;
   const discover = deps.discover || discoverForRun;
   const analyze = deps.analyze || analyzeTranscripts;
   const synthesize = deps.synthesize || synthesizeProposal;
   const fold = deps.fold || foldForRun;
+  const prefetch = deps.prefetch || ((pending) => prefetchRemoteTranscripts(pending, { config }));
   const { canonical, pointer } = bootstrapTargets(config.memoryFiles);
 
   const { transcripts, perHarness } = capTranscripts(await discover(ctx), config);
@@ -97,6 +110,7 @@ export async function bootstrapRun(ctx, deps = {}) {
     repo,
     memoryHash,
     force: Boolean(ctx.flags.force),
+    prefetch,
   });
   info(
     `${color.cyan("·")} evidence: ${result.summary.analyzed} new · ${result.summary.cached} cached · ` +
@@ -166,7 +180,7 @@ export function printBootstrap(result, config) {
     }
     for (const s of result.applied.skills) out(`  ${color.green("wrote")} ${s.path} (new skill)`);
     for (const f of result.applied.failed) {
-      out(`  ${color.red("failed")} ${f.file}${f.edit ? ` (${f.edit})` : ""}: ${f.error}`);
+      out(`  ${formatFailureLine(f)}`);
     }
   }
   out("");

@@ -1,13 +1,16 @@
 import { discoverTranscripts } from "../discovery/index.js";
+import { pruneHostCache } from "../discovery/cache.js";
 import { corpusMix, formatCorpusMix } from "../interaction.js";
 import { color, info, json, out } from "../logger.js";
 import { attachSiblingClones } from "../repo.js";
+import { closeSshMasters } from "../discovery/remote/ssh.js";
 
 /** Shared by every command that needs the transcript set. */
 export async function discoverForRun(ctx) {
-  const { repo, config, strict } = ctx;
-  attachSiblingClones(repo, config.discovery.cloneRoots);
-  const result = await discoverTranscripts({ repo, config, strict });
+  const { repo, scope, config, strict } = ctx;
+  if (scope?.kind !== "user") attachSiblingClones(repo, config.discovery.cloneRoots);
+  const result = await discoverTranscripts({ repo, scope, config, strict });
+  ctx.remoteMasters = [...(ctx.remoteMasters || []), ...(result.remoteMasters || [])];
   if (ctx.limit && result.transcripts.length > ctx.limit) {
     result.truncated = result.transcripts.length - ctx.limit;
     result.transcripts = result.transcripts.slice(0, ctx.limit);
@@ -23,27 +26,68 @@ function ago(ms) {
   return `${days}d ago`;
 }
 
+export async function closeRemoteDiscovery(ctx) {
+  await closeSshMasters(ctx.remoteMasters || []);
+  ctx.remoteMasters = [];
+}
+
 export async function cmdScan(ctx) {
-  const { transcripts, perHarness, truncated } = await discoverForRun(ctx);
+  try {
+    return await cmdScanCore(ctx);
+  } finally {
+    await closeRemoteDiscovery(ctx);
+    pruneHostCache(ctx.config.state.root);
+  }
+}
+
+async function cmdScanCore(ctx) {
+  const { transcripts, perHarness, perHost = [], truncated } = await discoverForRun(ctx);
   const mix = corpusMix(transcripts);
 
   if (ctx.flags.json) {
-    json({ repo: ctx.repo.name, perHarness, mix, transcripts });
+    json({
+      repo: ctx.repo.name,
+      ...(ctx.scope ? { scope: ctx.scope.kind } : {}),
+      perHarness,
+      perHost,
+      mix,
+      transcripts: transcripts.map((transcript) => {
+        const serialized = { ...transcript };
+        delete serialized.remote;
+        return serialized;
+      }),
+    });
     return 0;
   }
 
-  out(`${ctx.repo.name} · ${ctx.repo.worktrees.length} worktree(s) · since ${ctx.config.discovery.since}`);
+  if (ctx.scope?.kind === "user") {
+    out(`user scope · since ${ctx.config.discovery.since}`);
+  } else {
+    out(`${ctx.repo.name} · ${ctx.repo.worktrees.length} worktree(s) · since ${ctx.config.discovery.since}`);
+  }
   out("");
 
-  const rows = [["HARNESS", "SCANNED", "MATCHED", "SELF", "CACHED", "NOTE"]];
+  const rows = [["HOST", "HARNESS", "SCANNED", "MATCHED", "SELF", "CACHED", "NOTE"]];
   for (const [harness, stats] of Object.entries(perHarness)) {
     rows.push([
+      "local",
       harness,
       String(stats.scanned),
       String(stats.matched),
       String(stats.self || 0),
       String(stats.cached),
       stats.error ? `unreadable: ${stats.error}` : "",
+    ]);
+  }
+  for (const host of perHost) {
+    rows.push([
+      host.host,
+      host.error ? "-" : Object.keys(host.harnesses || {}).join(",") || "-",
+      String(host.scanned || 0),
+      String(host.matched || 0),
+      String(host.self || 0),
+      "-",
+      hostNote(host),
     ]);
   }
   out(table(rows));
@@ -53,35 +97,76 @@ export async function cmdScan(ctx) {
 
   const byTier = { 0: 0, 1: 0, 1.5: 0, 2: 0, 3: 0 };
   for (const t of transcripts) byTier[t.association.tier] += 1;
-  out(
-    `${transcripts.length} transcript(s) associated with this repo · ` +
-      `tier0 ${byTier[0]} (explicit import) · tier1 ${byTier[1]} (exact) · ` +
-      `tier1.5 ${byTier[1.5]} (sibling clone) · ` +
-      `tier2 ${byTier[2]} (remote) · tier3 ${byTier[3]} (best-effort) · ` +
-      formatCorpusMix(mix),
-  );
+  if (ctx.scope?.kind === "user") {
+    const byProject = new Map();
+    for (const t of transcripts) {
+      const key = t.project || t.cwd || "(unknown)";
+      byProject.set(key, (byProject.get(key) || 0) + 1);
+    }
+    out(
+      `${transcripts.length} transcript(s) across ${byProject.size} project(s) · ` +
+        `tier0 ${byTier[0]} (explicit import) · tier1 ${byTier[1]} (git) · ` +
+        `tier2 ${byTier[2]} (remote) · tier3 ${byTier[3]} (cwd) · ` +
+        formatCorpusMix(mix),
+    );
+  } else {
+    out(
+      `${transcripts.length} transcript(s) associated with this repo · ` +
+        `tier0 ${byTier[0]} (explicit import) · tier1 ${byTier[1]} (exact) · ` +
+        `tier1.5 ${byTier[1.5]} (sibling clone) · ` +
+        `tier2 ${byTier[2]} (remote) · tier3 ${byTier[3]} (best-effort) · ` +
+        formatCorpusMix(mix),
+    );
+  }
   if (byTier[3] && !ctx.strict) out(color.dim("  re-run with --strict to exclude the best-effort tier"));
   if (truncated) out(color.dim(`  --limit ${ctx.limit} is hiding ${truncated} more transcript(s)`));
   out("");
 
   const preview = transcripts.slice(0, 25);
-  const detail = [["HARNESS", "SESSION", "KIND", "WHEN", "SIZE", "TIER", "HOW"]];
+  const detail =
+    ctx.scope?.kind === "user"
+      ? [["HOST", "HARNESS", "SESSION", "KIND", "WHEN", "SIZE", "TIER", "PROJECT"]]
+      : [["HOST", "HARNESS", "SESSION", "KIND", "WHEN", "SIZE", "TIER", "HOW"]];
   for (const t of preview) {
-    detail.push([
-      t.harness,
-      t.nativeId.slice(0, 12),
-      t.interaction,
-      ago(t.mtimeMs),
-      t.bytes ? `${Math.round(t.bytes / 1024)}KB` : "-",
-      `t${t.association.tier}`,
-      t.association.reason,
-    ]);
+    detail.push(
+      ctx.scope?.kind === "user"
+        ? [
+            t.host || "local",
+            t.harness,
+            t.nativeId.slice(0, 12),
+            t.interaction,
+            ago(t.mtimeMs),
+            t.bytes ? `${Math.round(t.bytes / 1024)}KB` : "-",
+            `t${t.association.tier}`,
+            String(t.project || t.cwd || "-").slice(0, 48),
+          ]
+        : [
+            t.host || "local",
+            t.harness,
+            t.nativeId.slice(0, 12),
+            t.interaction,
+            ago(t.mtimeMs),
+            t.bytes ? `${Math.round(t.bytes / 1024)}KB` : "-",
+            `t${t.association.tier}`,
+            t.association.reason,
+          ],
+    );
   }
   out(table(detail));
   if (transcripts.length > preview.length) {
     info(color.dim(`  ... and ${transcripts.length - preview.length} more`));
   }
   return 0;
+}
+
+/** One host row's note: the named failure, or what the probe found over there. */
+function hostNote(host) {
+  if (host.error) return `skipped: ${host.error}`;
+  const parts = [];
+  if (host.node) parts.push(`node ${host.node}`);
+  if (host.duplicates) parts.push(`${host.duplicates} already seen locally`);
+  for (const warning of host.warnings || []) parts.push(warning);
+  return parts.join(" · ");
 }
 
 export function table(rows) {

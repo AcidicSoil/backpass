@@ -1,6 +1,6 @@
 import { UserError, color, info, warn } from "./logger.js";
 import { DEFAULT_EFFORT, LEGACY_DEFAULT_AGENTS } from "./config.js";
-import { AcpxError, acpxVersion, classifyAcpxFailure, probeSession } from "./acpx.js";
+import { AcpxError, SESSION_CREATE_TIMEOUT_MS, acpxVersion, classifyAcpxFailure, probeSession } from "./acpx.js";
 import { ambiguousModelDetail, providerAuthState, rankCollidingIds, readProviderAuthTypes } from "./provider-auth.js";
 import { runCapture } from "./subprocess.js";
 
@@ -9,8 +9,8 @@ import { runCapture } from "./subprocess.js";
  *
  * Each role (analysis, synthesis) has a ladder of candidates - a model id served by a
  * few harnesses, in preference order. This module walks the ladder and picks the first
- * candidate that is installed, authenticated, and serves the model, using a ~1.5s
- * zero-token probe per candidate. The probe is a *filter*, not a guarantee: the first
+ * candidate that is installed, authenticated, and serves the model, using a zero-token
+ * probe per candidate. The probe is a *filter*, not a guarantee: the first
  * real call is the decider, and a classifiable failure there (AUTH_REQUIRED, model
  * rejected, adapter missing) demotes the candidate and falls through to the next one.
  *
@@ -23,8 +23,8 @@ import { runCapture } from "./subprocess.js";
  * All model invocation still goes through `src/acpx.js`. The one documented exception
  * is `NATIVE_PROBES` below: the claude adapter creates sessions happily while logged
  * out and only fails at prompt time, so its login state has to come from the harness's
- * own `claude auth status`. opencode's ACP session has been seen to wedge for minutes
- * on a large profile, so `opencode models` answers first and the ACP probe is capped.
+ * own `claude auth status`. `opencode models` answers first because its ACP session has
+ * been seen to wedge on a large profile.
  *
  * Verdicts are cached in `.backpass/agent-probe-cache.json` (12h for ok, 30min for
  * negatives) and memoized for the run. An acpx version change invalidates every entry;
@@ -53,6 +53,7 @@ export const VERDICT_LABELS = {
   "model-unavailable": "model not advertised",
   unreachable: "not installed / not spawnable",
   timeout: "probe timed out",
+  "empty-output": "returned no output",
 };
 
 const LOGIN_HINTS = {
@@ -177,7 +178,8 @@ export function candidateKey({ agent, model }) {
  *
  * @param {{ agent: string, model: string }} candidate
  * @param {{ cwd?: string, sessionName?: string,
- *   probeSession?: (args: { agent: string, sessionName: string, cwd?: string, timeoutMs?: number }) =>
+ *   probeSession?: (args: { agent: string, sessionName: string, cwd?: string,
+ *     timeoutMs?: number, createTimeoutMs?: number }) =>
  *     Promise<{ verdict: string, detail: string, availableModels?: string[], transient?: boolean }>,
  *   runCapture?: typeof runCapture,
  *   providerAuthTypes?: Record<string, "subscription" | "api_key">,
@@ -199,6 +201,7 @@ export async function probeCandidate(candidate, options = {}) {
     sessionName,
     cwd,
     timeoutMs: PROBE_TIMEOUT_BY_AGENT[agent] || PROBE_TIMEOUT_MS,
+    createTimeoutMs: SESSION_CREATE_TIMEOUT_MS,
   });
   if (result.verdict !== "ok") {
     return {
@@ -265,9 +268,23 @@ function defaultSleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function hintFor(agent, verdict) {
+/**
+ * "empty-output" is not always fixed by logging in - a genuinely blank, silent call
+ * can also be a quota/credits problem invisible to backpass. But when the harness did
+ * write something to stderr, that text is the actual diagnosis and belongs in front of
+ * this generic advice, not instead of it - see `assertNonEmptyOutput` in acpx.js.
+ */
+const EMPTY_OUTPUT_HINT = "check the provider account behind this model (quota, credits, a suspended key)";
+
+function emptyOutputHint(stderr) {
+  const line = firstLine(stderr);
+  return line ? `${EMPTY_OUTPUT_HINT} - stderr: ${line}` : EMPTY_OUTPUT_HINT;
+}
+
+function hintFor(agent, verdict, stderr) {
   if (verdict === "unauthenticated" && LOGIN_HINTS[agent]) return `-> run: ${LOGIN_HINTS[agent]}`;
   if (verdict === "unreachable") return `-> install the ${agent} CLI`;
+  if (verdict === "empty-output") return `-> ${emptyOutputHint(stderr)}`;
   return "";
 }
 
@@ -466,7 +483,7 @@ export class AgentResolver {
    * there is something to fall through to (the next `resolve(role)` walks on), false
    * when the pick was pinned by the user - then the error is theirs to see.
    */
-  async demote(role, pick, verdict, detail = "") {
+  async demote(role, pick, verdict, detail = "", stderr = "") {
     if (pick.pinned) return false;
     const key = candidateKey({ agent: pick.agent, model: pick.ladderModel });
     if (this.memo.get(key)?.verdict === "ok") {
@@ -478,6 +495,7 @@ export class AgentResolver {
         resolvedModel: null,
         checkedAt: new Date(this.now()).toISOString(),
         ...(authState === null ? {} : { authState }),
+        ...(stderr ? { stderr } : {}),
       };
       this.memo.set(key, entry);
       const cache = await this.loadCache();
@@ -503,7 +521,7 @@ export class AgentResolver {
         const verdict = isAcpxError ? classifyAcpxFailure(err) : null;
         if (isAcpxError && pick.pinned) throw pinnedFailureError(role, pick, verdict, err);
         if (!verdict) throw err;
-        await this.demote(role, pick, verdict, err.message);
+        await this.demote(role, pick, verdict, err.message, isAcpxError ? err.stderr : "");
       }
     }
   }
@@ -541,6 +559,8 @@ function pinnedFailureError(role, pick, verdict, err) {
     hint = `run: ${LOGIN_HINTS[pick.agent]}; ${pin}`;
   } else if (verdict === "unreachable") {
     hint = `install the ${pick.agent} CLI; ${pin}`;
+  } else if (verdict === "empty-output") {
+    hint = `${emptyOutputHint(err?.stderr)}; ${pin}`;
   } else if (verdict) {
     hint = pin;
   }
@@ -552,11 +572,17 @@ function exhaustedError(role, trail) {
   const width = Math.max(...trail.map((t) => t.model.length));
   const lines = trail.map((t) => {
     const label = VERDICT_LABELS[t.verdict] || t.verdict;
-    const hint = hintFor(t.agent, t.verdict);
+    const hint = hintFor(t.agent, t.verdict, t.stderr);
     return `  ${t.model.padEnd(width)}  ${t.agent.padEnd(9)} ${label}${t.detail ? ` (${t.detail})` : ""}${hint ? `  ${hint}` : ""}`;
   });
-  return new UserError(
-    `no available agent for the ${role} pass\n\n${lines.join("\n")}`,
-    `log in to one of the harnesses above, or pin one explicitly: backpass --${role}-agent <agent> --${role}-model <id>`,
-  );
+  // "log in" is only true advice when something in the trail is actually an auth
+  // failure - an all-"empty-output" trail (exhausted credits) needs its own line, not
+  // login instructions that don't apply to any candidate shown above.
+  const pinHint = `pin one explicitly: backpass --${role}-agent <agent> --${role}-model <id>`;
+  const closing = trail.some((t) => t.verdict === "unauthenticated")
+    ? `log in to one of the harnesses above, or ${pinHint}`
+    : trail.every((t) => t.verdict === "empty-output")
+      ? `${EMPTY_OUTPUT_HINT} for the candidates above, or ${pinHint}`
+      : pinHint;
+  return new UserError(`no available agent for the ${role} pass\n\n${lines.join("\n")}`, closing);
 }

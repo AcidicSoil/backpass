@@ -18,6 +18,7 @@ import {
 } from "../src/skills.js";
 import { applyDecisions } from "../src/apply/writer.js";
 import { DEFAULT_CONFIG } from "../src/config.js";
+import { UserError } from "../src/logger.js";
 
 function tmpRepo() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "backpass-skills-"));
@@ -126,7 +127,7 @@ test("writeSkill lands in .agents/skills and links .claude/skills to it", () => 
   assert.deepEqual(again.created, []);
 });
 
-test("resolveOverflowTarget prefers .agents/skills and never auto-picks bare skills/", () => {
+test("resolveOverflowTarget honors an existing configured directory", () => {
   const empty = tmpRepo();
   assert.deepEqual(resolveOverflowTarget(empty), { kind: "skills", dir: CANONICAL_SKILLS_DIR, warnings: [] });
   assert.equal(resolveOverflowTarget(empty, ".claude/skills").dir, CANONICAL_SKILLS_DIR);
@@ -134,13 +135,46 @@ test("resolveOverflowTarget prefers .agents/skills and never auto-picks bare ski
   const bare = tmpRepo();
   fs.mkdirSync(path.join(bare, "skills"));
   fs.mkdirSync(path.join(bare, "docs"));
-  assert.equal(resolveOverflowTarget(bare).dir, CANONICAL_SKILLS_DIR);
-  assert.equal(resolveOverflowTarget(bare, ".claude/skills").dir, CANONICAL_SKILLS_DIR);
-
-  // An explicitly configured directory that exists is the user's call.
   assert.equal(resolveOverflowTarget(bare, "skills").dir, "skills");
-  // ...but one that does not exist falls back to the canonical dir.
   assert.equal(resolveOverflowTarget(bare, "nope/skills").dir, CANONICAL_SKILLS_DIR);
+
+  fs.mkdirSync(path.join(bare, ".claude", "skills"), { recursive: true });
+  assert.deepEqual(resolveOverflowTarget(bare, ".claude/skills"), {
+    kind: "skills",
+    dir: ".claude/skills",
+    warnings: [],
+  });
+  assert.equal(resolveOverflowTarget(bare, ".claude/skills/").dir, ".claude/skills");
+  assert.equal(resolveOverflowTarget(bare, ".claude\\skills\\").dir, ".claude/skills");
+});
+
+test("configured skills directories cannot escape the repository", () => {
+  const root = tmpRepo();
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "backpass-outside-skills-"));
+  fs.mkdirSync(path.join(root, ".claude"), { recursive: true });
+  fs.symlinkSync(outside, path.join(root, ".claude", "skills"), "dir");
+
+  for (const skillsDir of [path.relative(root, outside), ".claude/skills"]) {
+    assert.throws(() => resolveOverflowTarget(root, skillsDir), UserError);
+  }
+});
+
+test("user skill discovery uses only configured harness roots", () => {
+  const root = tmpRepo();
+  const relocated = path.join(root, "claude-config", "skills");
+  const stale = path.join(root, CLAUDE_SKILLS_LINK, "stale", "SKILL.md");
+  const active = path.join(relocated, "active", "SKILL.md");
+  fs.mkdirSync(path.dirname(stale), { recursive: true });
+  fs.mkdirSync(path.dirname(active), { recursive: true });
+  fs.writeFileSync(stale, "---\nname: stale\ndescription: stale trigger\n---\n\nbody\n");
+  fs.writeFileSync(active, "---\nname: active\ndescription: active trigger\n---\n\nbody\n");
+
+  assert.deepEqual(
+    loadProjectSkills(root, CANONICAL_SKILLS_DIR, [CANONICAL_SKILLS_DIR, relocated], { exact: true }).map(
+      (skill) => skill.name,
+    ),
+    ["active"],
+  );
 });
 
 test("project skill discovery includes separate canonical and Claude roots without double-counting symlinks", () => {
@@ -245,4 +279,71 @@ test("applyDecisions writes accepted extractions through the skills layout and s
     `${CLAUDE_SKILLS_LINK} -> ${CLAUDE_SKILLS_LINK_TARGET}`,
   ]);
   assert.ok(fs.existsSync(path.join(root, CLAUDE_SKILLS_LINK, "release-signing", "SKILL.md")));
+});
+
+test("user apply links relocated Claude skills without relying on directory order", () => {
+  const root = tmpRepo();
+  const claudeRoot = path.join(root, "claude-config");
+  const relocated = path.join(claudeRoot, "skills");
+  const previous = process.env.CLAUDE_CONFIG_DIR;
+  process.env.CLAUDE_CONFIG_DIR = claudeRoot;
+  try {
+    fs.writeFileSync(path.join(root, "AGENTS.md"), "# Memory\n\n- Sign releases with the key.\n");
+    const edit = {
+      id: "e1",
+      kind: "extract",
+      file: "AGENTS.md",
+      find: "- Sign releases with the key.",
+      replace: "- Release signing: see the release-signing skill.",
+      skill: SKILL,
+    };
+    const skillsDirs = [path.join(root, "custom-skills"), path.join(root, ".codex", "skills"), CANONICAL_SKILLS_DIR];
+    const results = applyDecisions({
+      proposal: {
+        scope: "user",
+        memoryFile: { path: "AGENTS.md" },
+        edits: [edit],
+        config: { skillsDirs },
+      },
+      decisions: { e1: "accepted" },
+      repo: { root },
+      state: { readRejections: () => [], writeRejections: () => {} },
+      config: { budgetTokens: 5000, skillsDirs },
+    });
+
+    assert.equal(results.failed.length, 0);
+    assert.ok(fs.lstatSync(relocated).isSymbolicLink());
+    assert.equal(fs.realpathSync(relocated), fs.realpathSync(path.join(root, CANONICAL_SKILLS_DIR)));
+    assert.ok(fs.existsSync(path.join(relocated, "release-signing", "SKILL.md")));
+    assert.equal(fs.existsSync(path.join(root, CLAUDE_SKILLS_LINK)), false);
+    assert.equal(fs.existsSync(path.join(root, ".codex", "skills")), false);
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = previous;
+  }
+});
+
+test("a skill symlinked into the loaded directory is read, because that is what a harness loads", () => {
+  const root = tmpRepo();
+  const library = path.join(root, "library");
+  const loaded = path.join(root, ".claude", "skills");
+  fs.mkdirSync(path.join(library, "beads"), { recursive: true });
+  fs.mkdirSync(loaded, { recursive: true });
+  fs.writeFileSync(
+    path.join(library, "beads", "SKILL.md"),
+    "---\nname: beads\ndescription: Use when tracking project work.\n---\n\n# Beads\n\nTrack work here.\n",
+  );
+  fs.writeFileSync(path.join(library, "solo.md"), "---\nname: solo\ndescription: A single-file skill.\n---\n\nBody.\n");
+  // How the user's machine is laid out: the library holds the content, the harness-loaded
+  // directory holds symlinks into it.
+  fs.symlinkSync(path.join(library, "beads"), path.join(loaded, "beads"));
+  fs.symlinkSync(path.join(library, "solo.md"), path.join(loaded, "solo.md"));
+  fs.symlinkSync(path.join(library, "missing"), path.join(loaded, "broken"));
+
+  const names = loadSkills(root, ".claude/skills").map((s) => s.name);
+  assert.deepEqual(names, ["beads", "solo"], "symlinked skills count; a broken symlink is skipped");
+
+  const beads = loadSkills(root, ".claude/skills").find((s) => s.name === "beads");
+  assert.match(beads.description, /tracking project work/);
+  assert.ok(beads.descriptionTokens > 0, "a symlinked skill's description is billed like any other");
 });

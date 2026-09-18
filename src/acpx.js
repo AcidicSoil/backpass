@@ -46,7 +46,10 @@ export function effortOptionKey(agent) {
 }
 
 export class AcpxError extends Error {
-  constructor(message, { stdout = "", stderr = "", code = null, timedOut = false, spawnError = null } = {}) {
+  constructor(
+    message,
+    { stdout = "", stderr = "", code = null, timedOut = false, spawnError = null, emptyOutput = false } = {},
+  ) {
     super(message);
     this.name = "AcpxError";
     this.stdout = stdout;
@@ -56,6 +59,8 @@ export class AcpxError extends Error {
     this.spawnError = spawnError;
     /** Set when the adapter has no session support at all (not an availability verdict). */
     this.unsupported = false;
+    /** Set when the call exited clean but produced no usable text - see `assertNonEmptyOutput`. */
+    this.emptyOutput = emptyOutput;
   }
 }
 
@@ -90,6 +95,37 @@ function notFoundError(result) {
 }
 
 /**
+ * How long `acpx <agent> sessions new` may take before backpass kills it.
+ *
+ * acpx spawns most built-in ACP adapters through an npm package-exec bridge
+ * (`acpx --verbose` prints it: `npm exec --yes --package=@agentclientprotocol/codex-acp@...`,
+ * `npx pi-acp@...`), so session create can include a cold package install before the
+ * adapter process exists at all. The codex adapter alone pulls a ~270MB platform binary,
+ * which no 60s budget can cover on a first run; npm also performs a registry
+ * security-advisory round-trip per spawn, which stalls session create when that endpoint
+ * is slow. An agent acpx launches as a local binary (grok) never pays either cost.
+ */
+export const SESSION_CREATE_TIMEOUT_MS = 180_000;
+
+/**
+ * A session-create timeout must be raised by name, before any generic handling.
+ *
+ * backpass kills the call itself, and acpx exits 130 on SIGTERM, so the result reaching
+ * `openSession` is an ordinary non-zero exit with empty stderr. Read generically it lands
+ * in the `unsupported` branch and the run stops with "its acpx adapter does not support
+ * sessions - upgrade acpx or omit the effort override": three claims that are all false
+ * for a harness whose adapter simply had not started yet, and advice that cannot help.
+ * `result.timedOut` is the only signal that separates the two, so it is checked first.
+ */
+function sessionCreateTimeoutError({ agent, acpxAgentArgs, timeoutMs }) {
+  const seconds = Math.round(timeoutMs / 1000);
+  return new UserError(
+    `acpx ${agent} did not create a session within ${seconds}s`,
+    `its ACP adapter did not finish starting; adapter initialization or a cold or stalled npm package fetch can block session creation - check with: acpx --verbose ${acpxAgentArgs.join(" ")} sessions new --name backpass-probe`,
+  );
+}
+
+/**
  * Availability verdicts for a failed acpx call. Only a *classifiable* failure is a
  * reason to drop a candidate and fall through to the next one; anything else (a
  * timeout on a long prompt, garbage output) stays a plain error so a run never
@@ -98,8 +134,8 @@ function notFoundError(result) {
  * acpx reports these on stderr as `[acpx] error: RUNTIME AUTH_REQUIRED ...` and
  * `Cannot apply --model "x": the ACP agent did not advertise that model`.
  *
- * @param {{ stderr?: string, spawnError?: { code?: string } | null, timedOut?: boolean }} failure
- * @returns {"unauthenticated" | "model-unavailable" | "unreachable" | null}
+ * @param {{ stderr?: string, spawnError?: { code?: string } | null, timedOut?: boolean, emptyOutput?: boolean }} failure
+ * @returns {"unauthenticated" | "model-unavailable" | "unreachable" | "empty-output" | null}
  */
 export function classifyAcpxFailure(failure) {
   if (!failure) return null;
@@ -110,6 +146,9 @@ export function classifyAcpxFailure(failure) {
   if (/\b(ENOENT|command not found|not found on PATH|failed to spawn|spawn .* ENOENT)\b/i.test(text)) {
     return "unreachable";
   }
+  // Checked last: a non-empty stderr that matches one of the patterns above is a more
+  // specific diagnosis than "no output", and must not be shadowed by it.
+  if (failure.emptyOutput) return "empty-output";
   return null;
 }
 
@@ -167,6 +206,61 @@ export function extractJson(text) {
     }
   }
   return null;
+}
+
+/** True when a model turn produced no usable text at all (blank or whitespace-only). */
+export function isBlankOutput(text) {
+  return !(text || "").trim();
+}
+
+/**
+ * A call that exits clean but returns no text at all is a silent failure, not a
+ * quality problem: the prompt contract always requires at least an empty JSON object
+ * (`"An empty array is a valid and useful answer"`), so blank output means the turn
+ * never really ran - most often an upstream provider error (exhausted credits, a
+ * suspended key) that an ACP bridge swallows without ever writing to stderr. Unlike
+ * garbled prose, no real work was done, so it is safe to demote the candidate and
+ * retry with the next one in the ladder rather than burning the whole run on it.
+ * Call this from inside a `withFallthrough` callback, before the caller's own
+ * `extractJson` check, so the throw is still in scope to trigger a fallthrough.
+ *
+ * Not for every model call: synthesis's edit turn never reads its own `text` (the edit
+ * happens through tool calls, so blank is normal there) and its annotate turn
+ * deliberately never switches agents mid-session - see `src/synthesize.js`. Both stay
+ * on `isBlankOutput` directly instead.
+ *
+ * @param {{ text: string, raw?: string, stderr?: string }} result
+ * @param {{ agent: string, model?: string | null }} pick
+ */
+export function assertNonEmptyOutput(result, { agent, model }) {
+  if (!isBlankOutput(result.text)) return result;
+  throw new AcpxError(`${agent} (${model || "default"}) returned no output`, {
+    stdout: result.raw ?? result.text,
+    // Even when the call itself is unclassifiable beyond "empty-output", a non-empty
+    // stderr is real diagnostic text (e.g. a provider error an ACP bridge otherwise
+    // swallows) and must reach the caller rather than being dropped here.
+    stderr: result.stderr || "",
+    emptyOutput: true,
+  });
+}
+
+/**
+ * Run one model turn - a one-shot `exec` when no effort override is needed, or a
+ * fresh named session when it is (`sessionName` is called only in that branch, so a
+ * caller's own call counter advances only for calls that actually open a session) -
+ * and reject blank output via `assertNonEmptyOutput`. Shared by `analyze.js` and
+ * `consolidate.js`; call from inside a `withFallthrough` callback so a blank result
+ * still falls through to the next candidate.
+ *
+ * @param {Parameters<typeof execOneShot>[0]} call
+ * @param {{ agent: string, model?: string | null, effort?: string | null }} pick
+ * @param {{ sessionName: () => string }} options
+ */
+export async function runModelCall(call, pick, { sessionName }) {
+  const result = pick.effort
+    ? await sessionPrompt({ ...call, effort: pick.effort, sessionName: sessionName() })
+    : await execOneShot(call);
+  return assertNonEmptyOutput(result, pick);
 }
 
 /**
@@ -249,17 +343,26 @@ export async function acpxVersion({ timeoutMs = 10_000 } = {}) {
  * real auth gate (ACP -32000); for claude it is not, which is why `src/agents.js`
  * checks `claude auth status` before ever calling this.
  *
- * @returns {Promise<{ verdict: "ok" | "unauthenticated" | "model-unavailable" | "unreachable" | "timeout",
+ * @returns {Promise<{ verdict: "ok" | "unauthenticated" | "model-unavailable" | "unreachable" | "timeout" | "empty-output",
  *   detail: string, availableModels: string[], transient?: boolean }>}
  */
-export async function probeSession({ agent, sessionName, cwd = undefined, timeoutMs = 20_000 }) {
+export async function probeSession({
+  agent,
+  sessionName,
+  cwd = undefined,
+  timeoutMs = 20_000,
+  createTimeoutMs = timeoutMs,
+}) {
   const acpxAgent = acpxAgentName(agent);
-  const created = await run([acpxAgent, "sessions", "new", "--name", sessionName], { timeoutMs, cwd });
+  const created = await run([acpxAgent, "sessions", "new", "--name", sessionName], {
+    timeoutMs: createTimeoutMs,
+    cwd,
+  });
   if (created.spawnError?.code === "ENOENT") throw notFoundError(created);
   if (created.timedOut) {
     return {
       verdict: "timeout",
-      detail: `probe timed out after ${Math.round(timeoutMs / 1000)}s`,
+      detail: `probe timed out after ${Math.round(createTimeoutMs / 1000)}s`,
       availableModels: [],
     };
   }
@@ -334,12 +437,21 @@ export async function execOneShot({
       throw new AcpxError(`acpx ${agent} exec timed out after ${timeoutSeconds}s`, result);
     }
     if (result.code !== 0) {
-      throw new AcpxError(`acpx ${agent} exec failed (exit ${result.code})`, result);
+      throw new AcpxError(
+        `acpx ${agent} exec failed (exit ${result.code}): ${firstLine(result.stderr) || `exit ${result.code}`}`,
+        result,
+      );
     }
 
     const combined = `${result.stdout}\n${result.stderr}`;
     const usage = parseTokenLine(combined) ?? recoverUsageFromStore({ agent, promptFile, cwd, startedAt });
-    return { text: stripAcpxNoise(result.stdout), usage, raw: result.stdout, notes: invocation.notes };
+    return {
+      text: stripAcpxNoise(result.stdout),
+      usage,
+      raw: result.stdout,
+      stderr: result.stderr,
+      notes: invocation.notes,
+    };
   } finally {
     invocation.dispose();
   }
@@ -357,6 +469,8 @@ export async function execOneShot({
  *
  * Resolves to the handle, or throws an `AcpxError` (`unsupported: true` when the adapter
  * has no session support; `sessionPrompt` only falls back when it can preserve the requested overlays).
+ * A `sessions new` that backpass itself killed on timeout is raised by name first
+ * (`SESSION_CREATE_TIMEOUT_MS`), never as missing session support.
  *
  * @returns {Promise<{ notes: string[],
  *   prompt: (options: { promptFile: string, timeoutSeconds?: number, promptRetries?: number,
@@ -364,10 +478,20 @@ export async function execOneShot({
  *     Promise<{ text: string, usage: Record<string, number> | null, raw: string, notes: string[] }>,
  *   close: () => Promise<void> }>}
  */
-export async function openSession({ agent, model = null, effort = null, sessionName, cwd, writeAccess = false }) {
+export async function openSession({
+  agent,
+  model = null,
+  effort = null,
+  sessionName,
+  cwd,
+  writeAccess = false,
+  createTimeoutMs = SESSION_CREATE_TIMEOUT_MS,
+}) {
   const invocation = prepareHarnessInvocation({ agent, model, effort, writeAccess });
   const notes = [...invocation.notes];
   const acpxAgentArgs = invocationAgentArgs(invocation, agent);
+  // The adapter is already up once the session exists, so the later `set` calls do not
+  // need the cold-start budget `sessions new` gets.
   const runOpts = { timeoutMs: 60_000, cwd, env: invocation.env };
   /** @type {Awaited<ReturnType<typeof run>>} */
   let created;
@@ -382,7 +506,7 @@ export async function openSession({ agent, model = null, effort = null, sessionN
         "--name",
         sessionName,
       ],
-      runOpts,
+      { ...runOpts, timeoutMs: createTimeoutMs },
     );
   } catch (err) {
     invocation.dispose();
@@ -391,6 +515,10 @@ export async function openSession({ agent, model = null, effort = null, sessionN
   if (created.spawnError && created.spawnError.code === "ENOENT") {
     invocation.dispose();
     throw notFoundError(created);
+  }
+  if (created.timedOut) {
+    invocation.dispose();
+    throw sessionCreateTimeoutError({ agent, acpxAgentArgs, timeoutMs: createTimeoutMs });
   }
   if (created.code !== 0) {
     invocation.dispose();
@@ -430,7 +558,9 @@ export async function openSession({ agent, model = null, effort = null, sessionN
     if (invocation.sessionMode) {
       const setMode = await run([...acpxAgentArgs, "-s", sessionName, "set-mode", invocation.sessionMode], runOpts);
       if (setMode.code !== 0) {
-        const detail = firstLine(setMode.stderr) || `exit ${setMode.code}`;
+        // Same degradation as session create: backpass kills the call, acpx exits 130 with
+        // no stderr, and `exit 130` would read as the harness rejecting the mode.
+        const detail = setMode.timedOut ? "timed out" : firstLine(setMode.stderr) || `exit ${setMode.code}`;
         if (invocation.sessionModeRequired) {
           throw new AcpxError(
             `acpx ${agent} could not enable write session mode=${invocation.sessionMode}: ${detail}`,
@@ -445,10 +575,10 @@ export async function openSession({ agent, model = null, effort = null, sessionN
     if (effort && invocation.setEffortKey) {
       const set = await run([...acpxAgentArgs, "-s", sessionName, "set", invocation.setEffortKey, effort], runOpts);
       if (set.code !== 0) {
-        throw new AcpxError(
-          `acpx ${agent} could not apply invocation-scoped effort=${effort}: ${firstLine(set.stderr) || `exit ${set.code}`}`,
-          set,
-        );
+        // Same degradation as session create: a killed call exits 130 with no stderr, and
+        // `exit 130` would read as the adapter refusing the effort key.
+        const detail = set.timedOut ? "timed out" : firstLine(set.stderr) || `exit ${set.code}`;
+        throw new AcpxError(`acpx ${agent} could not apply invocation-scoped effort=${effort}: ${detail}`, set);
       }
     }
   } catch (err) {
@@ -471,6 +601,11 @@ export async function openSession({ agent, model = null, effort = null, sessionN
       "--prompt-retries",
       String(promptRetries),
       ...acpxAgentArgs,
+      // `--agent <command>` has no `-s` of its own (acpx 0.13.1/0.13.2: `unknown
+      // option '-s'`, exit 2). `-s`/`--file` live on `prompt`. Built-in agents still
+      // accept the implicit form (`acpx codex -s ... --file ...`); `acpx codex prompt
+      // --help` documents the subcommand too, but changing that path is unnecessary.
+      ...(invocation.acpxAgentCommand ? ["prompt"] : []),
       "-s",
       sessionName,
       "--file",
@@ -478,7 +613,12 @@ export async function openSession({ agent, model = null, effort = null, sessionN
     ];
     const result = await run(args, { timeoutMs: (timeoutSeconds + 30) * 1000, cwd, env: invocation.env });
     if (result.timedOut) throw new AcpxError(`acpx ${agent} session prompt timed out after ${timeoutSeconds}s`, result);
-    if (result.code !== 0) throw new AcpxError(`acpx ${agent} session prompt failed (exit ${result.code})`, result);
+    if (result.code !== 0) {
+      throw new AcpxError(
+        `acpx ${agent} session prompt failed (exit ${result.code}): ${firstLine(result.stderr) || `exit ${result.code}`}`,
+        result,
+      );
+    }
 
     const combined = `${result.stdout}\n${result.stderr}`;
     /** @type {Record<string, number> | null} */
@@ -489,7 +629,7 @@ export async function openSession({ agent, model = null, effort = null, sessionN
       usage = cumulative ? subtractUsage(cumulative, storeUsageSeen) : null;
       if (cumulative) storeUsageSeen = cumulative;
     }
-    return { text: stripAcpxNoise(result.stdout), usage, raw: result.stdout, notes };
+    return { text: stripAcpxNoise(result.stdout), usage, raw: result.stdout, stderr: result.stderr, notes };
   };
 
   return { notes, prompt, close };
@@ -521,10 +661,11 @@ export async function sessionPrompt({
   promptRetries = 1,
   approveReads = true,
   suppressReads = true,
+  createTimeoutMs = SESSION_CREATE_TIMEOUT_MS,
 }) {
   let session;
   try {
-    session = await openSession({ agent, model, effort, sessionName, cwd });
+    session = await openSession({ agent, model, effort, sessionName, cwd, createTimeoutMs });
   } catch (err) {
     if (!(err instanceof AcpxError) || !err.unsupported) throw err;
     if (effort && effortOptionKey(agent)) {

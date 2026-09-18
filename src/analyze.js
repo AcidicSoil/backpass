@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { execOneShot, extractJson, sessionPrompt, usageRecord } from "./acpx.js";
+import { extractJson, runModelCall, usageRecord } from "./acpx.js";
 import { distill } from "./distill.js";
 import { classifyInteraction } from "./interaction.js";
 import { readTranscript } from "./discovery/index.js";
@@ -40,13 +40,43 @@ function noteOnce(note) {
 /** Negative evidence carries one of these classes; anything else is dropped as unjudged. */
 export const NEGATIVE_CLASSES = ["harm", "non-compliance", "irrelevant"];
 
-/** Evidence items without a verbatim quote are dropped - the rubric's central rule. */
-export function sanitizeEvidence(parsed, memoryFile = null) {
-  const clean = { positive: [], negative: [], gaps: [], usedRawTranscript: Boolean(parsed?.usedRawTranscript) };
+/** Whitespace-insensitive form used to check a quote against the trace it claims to come from. */
+function foldSpace(text) {
+  return String(text).replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Evidence items without a verbatim quote are dropped - the rubric's central rule.
+ *
+ * When `trace` is supplied and the model did not open the raw transcript, a quote must
+ * also appear in that trace (whitespace folded). A quote that is long enough but not in
+ * the trace is a paraphrase, and a paraphrase is a claim without evidence. When the model
+ * reports `usedRawTranscript`, the quote may come from text the distiller truncated or
+ * elided, so the substring check is skipped rather than punishing the honest path. Only
+ * the literal boolean opts out: a model that answers `"false"` must still anchor its
+ * quotes, or a stringly-typed reply would disable the check it is meant to fail.
+ *
+ * `quotesNotInTrace` counts what the trace check rejected, so a run whose analysis model
+ * paraphrases everything reads as that rather than as a clean repo.
+ */
+export function sanitizeEvidence(parsed, memoryFile = null, trace = null) {
+  const clean = {
+    positive: [],
+    negative: [],
+    gaps: [],
+    usedRawTranscript: parsed?.usedRawTranscript === true,
+    quotesNotInTrace: 0,
+  };
   if (!parsed || typeof parsed !== "object") return clean;
 
   const validInstructions = memoryFile ? new Set(instructionUnits(memoryFile).map((unit) => unit.id)) : null;
-  const hasQuote = (item) => typeof item?.quote === "string" && item.quote.trim().length >= 8;
+  const foldedTrace = typeof trace === "string" && !clean.usedRawTranscript ? foldSpace(trace) : null;
+  const hasQuote = (item) => {
+    if (typeof item?.quote !== "string" || item.quote.trim().length < 8) return false;
+    if (foldedTrace === null || foldedTrace.includes(foldSpace(item.quote))) return true;
+    clean.quotesNotInTrace += 1;
+    return false;
+  };
 
   for (const key of ["positive", "negative"]) {
     for (const item of Array.isArray(parsed[key]) ? parsed[key] : []) {
@@ -116,6 +146,7 @@ async function analyzeOne({
   memoryFile,
   config,
   repo,
+  modelCwd = null,
   slot = 0,
   openGapIndex = "(none yet)",
   skillIndex = "(this repo has no skills)",
@@ -171,18 +202,14 @@ async function analyzeOne({
       agent: pick.agent,
       model: pick.model,
       promptFile,
-      cwd: repo.root,
+      cwd: modelCwd || repo.root,
       timeoutSeconds: config.timeoutSeconds,
       promptRetries: config.promptRetries,
     };
     // Route effortful calls through a fresh per-transcript session so each harness's
     // invocation-scoped overlay or safe fallback is applied; otherwise one-shot is cheaper.
-    if (!pick.effort) return execOneShot(call);
-    callCounter += 1;
-    return sessionPrompt({
-      ...call,
-      effort: pick.effort,
-      sessionName: `backpass-analysis-${process.pid}-${slot}-${callCounter}`,
+    return runModelCall(call, pick, {
+      sessionName: () => `backpass-analysis-${process.pid}-${slot}-${++callCounter}`,
     });
   });
   for (const note of result.notes || []) noteOnce(note);
@@ -194,7 +221,7 @@ async function analyzeOne({
 
   return {
     status: "ok",
-    evidence: sanitizeEvidence(parsed, memoryFile),
+    evidence: sanitizeEvidence(parsed, memoryFile, distilled.trace),
     usage: usageRecord(ranWith, result),
     distilled,
   };
@@ -226,8 +253,10 @@ export async function analyzeTranscripts({
   skills = [],
   config,
   repo,
+  modelCwd = null,
   memoryHash,
   force = false,
+  prefetch = null,
 }) {
   const state = config.state;
   const pending = [];
@@ -239,18 +268,31 @@ export async function analyzeTranscripts({
     failed: 0,
     usage: [],
     staleMemoryHash: 0,
+    quotesNotInTrace: 0,
   };
   const priorHashes = new Set();
+  const transcriptMetadata = (transcript) => ({
+    harness: transcript.harness,
+    id: transcript.id,
+    identity: transcriptIdentity(transcript),
+    path: transcript.path,
+    mtimeMs: transcript.mtimeMs,
+    bytes: transcript.bytes,
+    startedAt: transcript.startedAt,
+    association: transcript.association,
+    interaction: classifyInteraction(transcript),
+    cwd: transcript.cwd || null,
+    project: transcript.project || null,
+    projectRoot: transcript.projectRoot || null,
+    host: transcript.host || null,
+  });
 
   for (const transcript of transcripts) {
     const existing = state.readEvidence(transcript);
     if (!force && isEvidenceFresh(existing, transcript, memoryHash)) {
-      const interaction = classifyInteraction(transcript);
-      if (existing.transcript?.interaction !== interaction) {
-        state.writeEvidence(transcript, {
-          ...existing,
-          transcript: { ...existing.transcript, interaction },
-        });
+      const updatedTranscript = { ...existing.transcript, ...transcriptMetadata(transcript) };
+      if (JSON.stringify(existing.transcript) !== JSON.stringify(updatedTranscript)) {
+        state.writeEvidence(transcript, { ...existing, transcript: updatedTranscript });
       }
       summary.cached += 1;
       continue;
@@ -271,6 +313,11 @@ export async function analyzeTranscripts({
         `missing, and reuse resumes once this pass re-judges it against the current memory file and skill descriptions`,
     );
   }
+
+  // Remote sessions have no content here yet. Fetch exactly the pending ones, before the
+  // pool, so a cached or skipped transcript never costs an ssh call - and so an
+  // unreachable host fails one transcript at a time rather than mid-fan-out.
+  if (prefetch) await prefetch(pending);
 
   if (!pending.length) {
     emitProgress("analyze:start", { pending: 0, cached: summary.cached, total: transcripts.length, jobs: config.jobs });
@@ -299,23 +346,20 @@ export async function analyzeTranscripts({
   // the skill index, so a mistake an existing skill's content covers is reported as a
   // failed trigger (`coveredBySkill`) instead of a brand-new gap.
   const openGapIndex = renderOpenGapIndex(state.readGapLedger(), memoryFile.path);
-  const skillIndex = renderSkillIndexForAnalysis(skills);
+  const skillIndex = renderSkillIndexForAnalysis(
+    modelCwd && path.resolve(modelCwd) !== path.resolve(repo.root)
+      ? skills.map((skill) => ({
+          ...skill,
+          path: path.isAbsolute(skill.path) ? skill.path : path.join(repo.root, skill.path),
+        }))
+      : skills,
+  );
 
   let done = 0;
   const evidenceTotals = { positive: 0, negative: 0, gaps: 0 };
   await pool(pending, config.jobs, async (transcript, _index, slot) => {
     const base = {
-      transcript: {
-        harness: transcript.harness,
-        id: transcript.id,
-        identity: transcriptIdentity(transcript),
-        path: transcript.path,
-        mtimeMs: transcript.mtimeMs,
-        bytes: transcript.bytes,
-        startedAt: transcript.startedAt,
-        association: transcript.association,
-        interaction: classifyInteraction(transcript),
-      },
+      transcript: transcriptMetadata(transcript),
       memoryHash,
       memoryPath: memoryFile.path,
       key: evidenceKey(transcript, memoryHash),
@@ -331,7 +375,16 @@ export async function analyzeTranscripts({
     });
 
     try {
-      const result = await analyzeOne({ transcript, memoryFile, config, repo, slot, openGapIndex, skillIndex });
+      const result = await analyzeOne({
+        transcript,
+        memoryFile,
+        config,
+        repo,
+        modelCwd,
+        slot,
+        openGapIndex,
+        skillIndex,
+      });
       if (result.status === "skipped") {
         summary.skipped += 1;
         state.writeEvidence(transcript, { ...base, status: "skipped", reason: result.reason });
@@ -347,6 +400,7 @@ export async function analyzeTranscripts({
         evidenceTotals.positive += result.evidence.positive.length;
         evidenceTotals.negative += result.evidence.negative.length;
         evidenceTotals.gaps += result.evidence.gaps.length;
+        summary.quotesNotInTrace += result.evidence.quotesNotInTrace;
         emitProgress("analyze:evidence", { ...evidenceTotals });
       }
     } catch (err) {
@@ -369,6 +423,14 @@ export async function analyzeTranscripts({
       }
     }
   });
+
+  if (summary.quotesNotInTrace) {
+    warn(
+      `${summary.quotesNotInTrace} quote(s) were discarded because they do not appear in the ` +
+        `distilled trace they claim to come from; a model that paraphrases instead of copying ` +
+        `produces fewer findings, not cleaner ones - consider a stronger analysis model`,
+    );
+  }
 
   emitProgress("analyze:done", summary);
   return summary;

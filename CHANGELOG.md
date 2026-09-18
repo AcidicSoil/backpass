@@ -1,5 +1,69 @@
 # Changelog
 
+## [0.1.24](https://github.com/kunchenguid/backpass/compare/backpass-v0.1.23...backpass-v0.1.24) (2026-09-16)
+
+
+### Bug Fixes
+
+* **config:** preserve global agent pins after init ([#137](https://github.com/kunchenguid/backpass/issues/137)) ([7d92241](https://github.com/kunchenguid/backpass/commit/7d922418138ea7089c5469130fa94ecbde2e87b4))
+
+## [0.1.23](https://github.com/kunchenguid/backpass/compare/backpass-v0.1.22...backpass-v0.1.23) (2026-09-16)
+
+
+### Bug Fixes
+
+* **acpx:** stop discarding stderr on empty-output classification ([#131](https://github.com/kunchenguid/backpass/issues/131)) ([4f5a684](https://github.com/kunchenguid/backpass/commit/4f5a684a4f3130ab5676b1ba26ec9928eca92287))
+* **apply:** compare skillsDir by resolved logical path and drop placeholder failure locations ([#133](https://github.com/kunchenguid/backpass/issues/133)) ([dc4124d](https://github.com/kunchenguid/backpass/commit/dc4124d342d18a4ea523483eb3bdd7d0c693424c))
+* **synthesize:** count stray edit-turn writes as touched ([#132](https://github.com/kunchenguid/backpass/issues/132)) ([dbaeced](https://github.com/kunchenguid/backpass/commit/dbaeced54538bb5bdd8e27c59f5eb8307e4f1109))
+
+## [0.1.22](https://github.com/kunchenguid/backpass/compare/backpass-v0.1.21...backpass-v0.1.22) (2026-09-13)
+
+
+### Features
+
+* **discovery:** collect sessions from remote machines over SSH ([#124](https://github.com/kunchenguid/backpass/issues/124)) ([fa712a0](https://github.com/kunchenguid/backpass/commit/fa712a07e928ae392f1c489788387a3fe4724e81))
+
+## [0.1.21](https://github.com/kunchenguid/backpass/compare/backpass-v0.1.20...backpass-v0.1.21) (2026-09-12)
+
+
+### Bug Fixes
+
+* **acpx:** fall through the agent ladder on clean-exit empty output ([#122](https://github.com/kunchenguid/backpass/issues/122)) ([764ed95](https://github.com/kunchenguid/backpass/commit/764ed9551ec68dc88b7b6a424e028d1a4c122b29))
+
+## [0.1.20](https://github.com/kunchenguid/backpass/compare/backpass-v0.1.19...backpass-v0.1.20) (2026-09-10)
+
+
+### Bug Fixes
+
+* **analyze:** discard evidence quotes that do not appear in the distilled trace ([#118](https://github.com/kunchenguid/backpass/issues/118)) ([7d171f7](https://github.com/kunchenguid/backpass/commit/7d171f750003fb7921824c88a652ed766aff83ce))
+
+## [0.1.19](https://github.com/kunchenguid/backpass/compare/backpass-v0.1.18...backpass-v0.1.19) (2026-09-07)
+
+
+### Bug Fixes
+
+* **skills:** see and stage skills that are symlinked into the loaded directory ([#113](https://github.com/kunchenguid/backpass/issues/113)) ([4e67dcd](https://github.com/kunchenguid/backpass/commit/4e67dcd7e3d5e17f9fb84deee45d65d4763de954))
+
+## [0.1.18](https://github.com/kunchenguid/backpass/compare/backpass-v0.1.17...backpass-v0.1.18) (2026-09-04)
+
+
+### Features
+
+* add user-level memory scope ([#101](https://github.com/kunchenguid/backpass/issues/101)) ([be2633a](https://github.com/kunchenguid/backpass/commit/be2633a6ab3552582b8e30bc418a86e5a61e44a7))
+* **apply:** unify funnel from findings to proposed edits ([#104](https://github.com/kunchenguid/backpass/issues/104)) ([aa714d1](https://github.com/kunchenguid/backpass/commit/aa714d1d5debe9b1ea39818245411a2563eac3de))
+* let runs target one memory file or skill ([#108](https://github.com/kunchenguid/backpass/issues/108)) ([5392421](https://github.com/kunchenguid/backpass/commit/5392421a7a5e892025e10e7f49721c77e0a1f43b))
+
+
+### Bug Fixes
+
+* **acpx:** send --agent session prompts through the prompt subcommand ([#100](https://github.com/kunchenguid/backpass/issues/100)) ([d9610ea](https://github.com/kunchenguid/backpass/commit/d9610eaae2bfb23fca92804ea468b2d1cf579a81))
+* **acpx:** surface opencode stderr on exec and session-prompt failures ([#109](https://github.com/kunchenguid/backpass/issues/109)) ([e167503](https://github.com/kunchenguid/backpass/commit/e167503bfa58d583f815c00742f98973721e1ac7))
+* allow acpx adapters to finish cold starts ([#110](https://github.com/kunchenguid/backpass/issues/110)) ([46a80e1](https://github.com/kunchenguid/backpass/commit/46a80e1415c1a8aa156c53f5a077ff37e380a755))
+* count only fold-issued sources toward session floors ([#105](https://github.com/kunchenguid/backpass/issues/105)) ([093921b](https://github.com/kunchenguid/backpass/commit/093921bf2f72b9383af34feef2836caf6285ac37))
+* preserve stable evidence session identities ([#106](https://github.com/kunchenguid/backpass/issues/106)) ([c4eb1fa](https://github.com/kunchenguid/backpass/commit/c4eb1fa505d0146b0853ff7d160cd88926cd7216))
+* require corroboration for every always-loaded edit ([#103](https://github.com/kunchenguid/backpass/issues/103)) ([e63f555](https://github.com/kunchenguid/backpass/commit/e63f555c175911a521b3a34652a6c049f1378bb9))
+* **skills:** honor configured Claude skills directory ([#96](https://github.com/kunchenguid/backpass/issues/96)) ([b20c40c](https://github.com/kunchenguid/backpass/commit/b20c40c0e2578ae3f0f7e0af45a4468a9a2e7e20))
+
 ## [0.1.17](https://github.com/kunchenguid/backpass/compare/backpass-v0.1.16...backpass-v0.1.17) (2026-08-31)
 
 

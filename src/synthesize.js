@@ -1,9 +1,10 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { extractJson, openSession, usageRecord } from "./acpx.js";
+import { extractJson, isBlankOutput, openSession, usageRecord } from "./acpx.js";
+import { userClaudeSkillsDir } from "./config.js";
 import { renderEvidenceForPrompt } from "./fold.js";
-import { renderInstructionIndex } from "./memory.js";
+import { renderInstructionIndex, resolveMemoryPath } from "./memory.js";
 import { renderPrompt, render, loadPrompt } from "./prompts.js";
 import { buildProposal, effectiveMaxEdits, ProposalViolation, renderChangesForPrompt } from "./proposal.js";
 import {
@@ -14,8 +15,9 @@ import {
   skillDescriptionTokens,
 } from "./skills.js";
 import { isSuppressedByRejection } from "./state.js";
+import { SURFACE_TARGET } from "./target.js";
 import { emitProgress } from "./progress.js";
-import { measureWorkspace, prepareWorkspace, repoFingerprint } from "./workspace.js";
+import { measureWorkspace, prepareWorkspace, repoFingerprint, workspacePathFor } from "./workspace.js";
 import { UserError, color, info, warn } from "./logger.js";
 
 /**
@@ -68,6 +70,8 @@ const EMPTY_TURN_VIOLATION =
   "the synthesis harness ended its turn with no output at all - no JSON, no prose, no tool call";
 const UNPARSEABLE_VIOLATION = "synthesis answered with text, but not with a JSON object";
 const KEPT_EDITING_VIOLATION = "synthesis kept editing the staging copy instead of annotating the measured changes";
+const EDIT_EMPTY_VIOLATION =
+  "the synthesis edit turn left the staging copy byte-identical to the original, so its first annotate turn had nothing to describe";
 
 /**
  * The budget the prompts frame is the always-loaded surface: the memory file plus
@@ -133,34 +137,101 @@ function harnessCountsOf(transcripts) {
   return counts;
 }
 
-/** The repo must be exactly as fingerprinted; the staging copy is the only place to write. */
+/**
+ * The repo must be exactly as fingerprinted; the staging copy is the only place to write.
+ *
+ * Skills staging withheld are left out: such a file is one backpass has guaranteed it will
+ * never write, so aborting a run over a third party's edit to it would discard measured
+ * work for nothing. That holds on every run for the two reasons staging settles before it
+ * narrows - the path resolves outside the repository, or into a location nothing may
+ * write. It does not hold for the one reason it settles after: a skill withheld only as a
+ * duplicate of a name already staged is still fingerprinted on a narrowed run, which never
+ * reaches that decision. An ordinary repository skill stays fingerprinted either way. A
+ * fingerprinted path can still resolve outside the repository - that is the ordinary
+ * user-scope layout - so a change there is reported for what it is rather than as a direct
+ * repository edit.
+ */
 function assertRepoUntouched(repo, before, workspaceRoot) {
   const after = repoFingerprint(repo, Object.keys(before));
   const moved = Object.keys(before).filter((file) => before[file] !== after[file]);
   if (!moved.length) return;
+  const insideRepo = (file) => {
+    try {
+      resolveMemoryPath(repo.root, file);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const inside = moved.filter(insideRepo);
+  const outside = moved.filter((file) => !inside.includes(file));
+  const claims = [];
+  if (inside.length) {
+    claims.push(
+      `synthesis changed ${inside.join(", ")} in the repository directly instead of the staging copy (${workspaceRoot})`,
+    );
+  }
+  if (outside.length) {
+    claims.push(
+      `${outside.join(", ")} changed during synthesis; ` +
+        `${outside.length > 1 ? "those paths resolve" : "that path resolves"} outside the repository`,
+    );
+  }
   throw new UserError(
-    `synthesis changed ${moved.join(", ")} in the repository directly instead of the staging copy ` +
-      `(${workspaceRoot}); nothing was proposed`,
-    `inspect the change with \`git diff\`, restore the file, and re-run - a harness that edits outside its cwd cannot be trusted with the synthesis role`,
+    `${claims.join("; also ")}; nothing was proposed`,
+    inside.length
+      ? `inspect the change with \`git diff\`, restore the file, and re-run - a harness that edits outside its cwd cannot be trusted with the synthesis role`
+      : `inspect the file and re-run - either the synthesis harness wrote through the link to a skill it was told is read-only, or another process changed the shared library mid-run`,
   );
+}
+
+function targetRule(target, memoryPath, skillsDir, stagedTargetPath = null, unstageable = []) {
+  if (target.kind === "skill") {
+    return (
+      `0. **This run targets \`./${stagedTargetPath || workspacePathFor(target.path)}\` only.** It is the one staged file. ` +
+      `Do not edit \`./${memoryPath}\` or any other skill, and do not create a skill; extraction does not apply.\n`
+    );
+  }
+  if (target.kind === "memory") {
+    return (
+      `0. **This run targets \`./${memoryPath}\` only.** The skills listed above live in the repository and are ` +
+      `read-only: do not edit them. You may still extract a NEW skill under \`./${skillsDir}/\`.\n`
+    );
+  }
+  if (unstageable.length) {
+    return (
+      `0. **The skills marked \`read-only\` above are not in your staging copy**, for the reason each row ` +
+      `gives, and backpass cannot write them at that path. Read them for grounding and treat what they ` +
+      `already cover as covered - do not edit them, re-create them, or copy their content into ` +
+      `\`./${memoryPath}\`.\n`
+    );
+  }
+  return "";
 }
 
 /**
  * Everything the edit and annotation turns need: prompt values, the `buildProposal`
  * context, and the overflow target.
  */
-function synthesisSetup({ memoryFile, summary, config, repo, harnessCounts }) {
+function synthesisSetup({ memoryFile, summary, config, repo, harnessCounts, scope = null }) {
   const state = config.state;
   const rejections = state.readRejections();
-  const overflow = resolveOverflowTarget(repo.root, config.skillsDir);
+  const userScope = scope?.kind === "user";
+  const overflow = resolveOverflowTarget(repo.root, config.skillsDir, {
+    claudeSkillsDir: userScope ? userClaudeSkillsDir() : undefined,
+    allowExternal: userScope,
+  });
   for (const w of overflow.warnings) warn(w);
-  const skillDirs = resolveProjectSkillDirs(repo.root, overflow.dir);
-  const skillFiles = loadProjectSkills(repo.root, overflow.dir);
+  const skillDirs = resolveProjectSkillDirs(repo.root, overflow.dir, config.skillsDirs || [], { exact: userScope });
+  const skillFiles = loadProjectSkills(repo.root, overflow.dir, config.skillsDirs || [], { exact: userScope });
+  // The budget is the whole always-loaded surface whatever the target: a skill target
+  // moves it by that skill's description-line delta, nothing else changes.
   const descriptionTokens = skillDescriptionTokens(skillFiles);
   const maxEdits = effectiveMaxEdits(memoryFile, config, descriptionTokens);
+  const target = config.target || SURFACE_TARGET;
 
   const common = {
-    MEMORY_PATH: memoryFile.path,
+    MEMORY_PATH: workspacePathFor(memoryFile.path),
     BUDGET_RULE: budgetRule(memoryFile, config, maxEdits, descriptionTokens),
     MAX_EDITS: String(maxEdits),
     MIN_GAP_EVIDENCE: String(config.minGapEvidence),
@@ -170,11 +241,13 @@ function synthesisSetup({ memoryFile, summary, config, repo, harnessCounts }) {
     memoryFile,
     config: { ...config, skillsDir: overflow.dir, skillDirs },
     repo,
+    scope,
     summary,
     harnessCounts,
     rejections,
     isSuppressed: isSuppressedByRejection,
     skillFiles,
+    target,
   };
 
   const promptDir = path.join(state.root, "prompts");
@@ -186,6 +259,7 @@ function synthesisSetup({ memoryFile, summary, config, repo, harnessCounts }) {
     overflow,
     skillDirs,
     skillFiles,
+    target,
     descriptionTokens,
     maxEdits,
     common,
@@ -202,7 +276,7 @@ function synthesisSetup({ memoryFile, summary, config, repo, harnessCounts }) {
  */
 function prefaceFor({ memoryFile, summary, config, repo, workspaceRoot, descriptionTokens = 0 }) {
   return render(loadPrompt("annotate-preface"), {
-    MEMORY_PATH: memoryFile.path,
+    MEMORY_PATH: workspacePathFor(memoryFile.path),
     REPO_NAME: repo.name,
     REPO_ROOT: repo.root,
     WORKSPACE_ROOT: workspaceRoot,
@@ -230,6 +304,9 @@ function terminalMessage(reason, attempts, violations) {
   }
   if (reason === "editing") {
     return `synthesis kept editing the staging copy instead of annotating it (${REMEASURE_TURNS} re-measurements)`;
+  }
+  if (reason === "edit-empty") {
+    return "synthesis made no changes to the staging copy during the edit turn, so its first annotate turn had nothing to describe";
   }
   return (
     `synthesis could not produce a valid proposal after ${Math.max(attempts - 1, 0)} re-prompt(s) ` +
@@ -276,10 +353,16 @@ async function annotateLoop({
   let saved = null;
   /** @type {{ reason: string, violations: string[] }} */
   let terminal;
+  // Whether the edit turn that preceded this loop left the staging copy untouched - a
+  // stray out-of-scope edit still counts as touched, so it is never hidden behind
+  // "edit-empty". Only the very first turn's measurement answers that question; a later
+  // remeasure reflects edits made during annotation instead, which "editing" already covers.
+  let editMadeNoChanges = false;
 
   for (let turn = 1; ; turn += 1) {
     assertRepoUntouched(repo, fingerprint, workspace.root);
     const measured = measureWorkspace(workspace);
+    if (turn === 1) editMadeNoChanges = measured.changes.length === 0 && !(measured.stray || []).length;
 
     let prompt = renderPrompt("annotate", {
       ...common,
@@ -325,8 +408,14 @@ async function annotateLoop({
     justRemeasured = false;
 
     // An empty turn is not a bad answer; it is no answer. Retry it once in a new session,
-    // because the accumulated context of this one is the likeliest reason it collapsed.
-    if (!(result.text || "").trim()) {
+    // because the accumulated context of this one is the likeliest reason it collapsed -
+    // unless the edit turn left nothing to describe in the first place, in which case a
+    // fresh session would be shown the same empty diff and retrying is pointless.
+    if (isBlankOutput(result.text)) {
+      if (turn === 1 && editMadeNoChanges) {
+        terminal = { reason: "edit-empty", violations: [EDIT_EMPTY_VIOLATION] };
+        break;
+      }
       emptyTurns += 1;
       if (emptyTurns > EMPTY_TURN_RETRIES) {
         terminal = { reason: "empty", violations: [EMPTY_TURN_VIOLATION] };
@@ -345,6 +434,10 @@ async function annotateLoop({
     attempts += 1;
     const parsed = extractJson(result.text);
     if (!parsed) {
+      if (turn === 1 && editMadeNoChanges) {
+        terminal = { reason: "edit-empty", violations: [EDIT_EMPTY_VIOLATION] };
+        break;
+      }
       violationsToShow = [UNPARSEABLE_VIOLATION];
       if (attempts >= ANNOTATE_TURNS) {
         terminal = { reason: "unparseable", violations: violationsToShow };
@@ -387,7 +480,15 @@ async function annotateLoop({
   });
 }
 
-export async function synthesizeProposal({ memoryFile, summary, config, repo, transcripts, runNote = "" }) {
+export async function synthesizeProposal({
+  memoryFile,
+  summary,
+  config,
+  repo,
+  transcripts,
+  runNote = "",
+  scope = null,
+}) {
   config.state.clearProposal();
   const harnessCounts = harnessCountsOf(transcripts);
   const {
@@ -396,6 +497,7 @@ export async function synthesizeProposal({ memoryFile, summary, config, repo, tr
     overflow,
     skillDirs,
     skillFiles,
+    target,
     descriptionTokens,
     maxEdits,
     common,
@@ -407,10 +509,45 @@ export async function synthesizeProposal({ memoryFile, summary, config, repo, tr
     config,
     repo,
     harnessCounts,
+    scope,
   });
+
+  // Staging holds only the write surface: every skill on a surface run, none of them on
+  // a memory-file target (new extracts are still measured), just the one on a skill target.
+  const stagedSkills = target.kind === "surface" ? null : target.kind === "skill" ? [target.path] : [];
+  const workspaceOptions = {
+    state,
+    repo,
+    memoryFile,
+    skillsDir: overflow.dir,
+    skillDirs,
+    stagedSkills,
+    allowExternal: scope?.kind === "user",
+  };
+  let workspace = prepareWorkspace(workspaceOptions);
+  const stagedSkillsDir =
+    workspace.skillMappings.find((mapping) => mapping.logical === overflow.dir)?.staged ||
+    workspacePathFor(overflow.dir);
+  // Unstaged skills keep their repository paths in the index: the model may read them
+  // there for grounding, and the target rule says they are not writable. The ones staging
+  // confined out are also marked, so a run that narrows nothing still says so.
+  const readOnlyReason = (file) =>
+    workspace.unstageable.find((entry) => file === entry.path || file.startsWith(`${entry.path}/`))?.reason || null;
+  const stagedSkillFiles = skillFiles.map((skill) => ({
+    ...skill,
+    path: workspace.stagedPaths.get(skill.path) || skill.path,
+    readOnly: readOnlyReason(skill.path),
+  }));
 
   const editValues = {
     ...common,
+    TARGET_RULE: targetRule(
+      target,
+      workspace.memoryWorkspacePath,
+      stagedSkillsDir,
+      target.kind === "skill" ? workspace.stagedPaths.get(target.path) || workspacePathFor(target.path) : null,
+      stagedSkillFiles.filter((skill) => skill.readOnly),
+    ),
     REPO_NAME: repo.name,
     REPO_ROOT: repo.root,
     TRANSCRIPT_COUNT: String(summary.analyzedSessions),
@@ -423,8 +560,8 @@ export async function synthesizeProposal({ memoryFile, summary, config, repo, tr
     BUDGET_TOKENS: String(config.budgetTokens),
     BUDGET_STATE: budgetState(memoryFile, config, descriptionTokens),
     INSTRUCTION_INDEX: renderInstructionIndex(memoryFile),
-    SKILLS_DIR: overflow.dir,
-    SKILL_INDEX: renderSkillIndex(skillFiles),
+    SKILLS_DIR: stagedSkillsDir,
+    SKILL_INDEX: renderSkillIndex(stagedSkillFiles),
     EVIDENCE: renderEvidenceForPrompt(summary),
     REJECTIONS: renderRejections(rejections),
   };
@@ -432,7 +569,10 @@ export async function synthesizeProposal({ memoryFile, summary, config, repo, tr
   const editPromptFile = path.join(promptDir, "synthesis-edit.md");
   fs.writeFileSync(editPromptFile, renderPrompt("synthesis", editValues));
 
-  const fingerprint = repoFingerprint(repo, [memoryFile.path, ...skillFiles.map((s) => s.path)]);
+  const fingerprint = repoFingerprint(repo, [
+    memoryFile.path,
+    ...skillFiles.filter((skill) => !readOnlyReason(skill.path)).map((skill) => skill.path),
+  ]);
   const sessionName = `backpass-synth-${process.pid}`;
   const timeoutSeconds = Math.max(config.timeoutSeconds, 900);
   const usage = [];
@@ -479,14 +619,12 @@ export async function synthesizeProposal({ memoryFile, summary, config, repo, tr
       return this.session.prompt(args);
     },
   };
-  /** @type {ReturnType<typeof prepareWorkspace>} */
-  let workspace = null;
   const editResult = await config.agents.withFallthrough("synthesis", async (current) => {
     ranWith = current.agent;
     holder.ranWith = current.agent;
     chosen = current;
     if (current !== pick) notes.push(`synthesis fell through to ${current.agent} (${current.model})`);
-    workspace = prepareWorkspace({ state, repo, memoryFile, skillsDir: overflow.dir, skillDirs });
+    workspace = prepareWorkspace(workspaceOptions);
     progress("edit", { attempt: 1 });
     holder.session = await openSession({
       agent: current.agent,

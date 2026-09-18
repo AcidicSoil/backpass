@@ -139,6 +139,39 @@ const SPLIT_THE_COPY = { editFirst: { "AGENTS.md": { replace: [[POINTERS, SPLIT]
 const proposalOf = (dir) => readJson(path.join(dir, ".backpass", "proposal.json"));
 const stagedTree = (dir) => snapshotTree(path.join(dir, ".backpass", "synthesis"));
 
+test("propose stages extracts in an existing configured Claude skills directory", () => {
+  const dir = makeCliRepo({ memory: MEMORY });
+  fs.mkdirSync(path.join(dir, ".claude", "skills"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".backpassrc.json"), JSON.stringify({ skillsDir: ".claude\\skills\\" }));
+  const claudePointers = POINTERS.replaceAll(".agents/skills", ".claude/skills");
+  const run = runCli(dir, ["propose", ...PIN], {
+    script: {
+      edit: {
+        "AGENTS.md": { replace: [[BOTH_SECTIONS, claudePointers]] },
+        "__SKILLS_DIR__/release-checklist/SKILL.md": skill("release-checklist"),
+        "__SKILLS_DIR__/incident-response/SKILL.md": skill("incident-response"),
+      },
+      annotations: [{ reply: COALESCED_ANSWER }],
+    },
+  });
+
+  assert.equal(run.status, 0, `the run should succeed:\n${run.output}`);
+  const staged = stagedTree(dir);
+  assert.ok(staged[".claude/skills/release-checklist/SKILL.md"]);
+  assert.ok(staged[".claude/skills/incident-response/SKILL.md"]);
+  assert.equal(staged[".agents/skills/release-checklist/SKILL.md"], undefined);
+  assert.deepEqual(
+    proposalOf(dir).edits[0].hunks.map((hunk) => hunk.file),
+    ["AGENTS.md"],
+  );
+  assert.deepEqual(
+    proposalOf(dir)
+      .edits[0].skills.map((skill) => skill.path)
+      .sort(),
+    [".claude/skills/incident-response/SKILL.md", ".claude/skills/release-checklist/SKILL.md"],
+  );
+});
+
 test("a remeasurement is not a failed annotation: it costs no attempt, and the new ids get a real one", () => {
   const dir = makeCliRepo({ memory: MEMORY });
   const run = runCli(dir, ["propose", ...PIN], {
@@ -276,6 +309,45 @@ test("a run that ends on an empty turn says so, and never reads an older proposa
   assert.ok(staged["AGENTS.md"].includes("## Incident response"));
   assert.ok(staged[".agents/skills/release-checklist/SKILL.md"]);
   assert.ok(staged[".agents/skills/incident-response/SKILL.md"]);
+});
+
+test("an edit turn that changes nothing, then answers blank, fails as edit-empty rather than a generic empty turn", () => {
+  const dir = makeCliRepo({ memory: MEMORY });
+  const run = runCli(dir, ["propose", ...PIN], {
+    script: { edit: {}, annotations: [{ empty: true }] },
+  });
+
+  assert.equal(run.status, 1, `the run should fail:\n${run.output}`);
+  assert.equal(run.editTurns(), 1);
+  // Retrying in a fresh session would show the same empty diff again, so the first blank
+  // turn ends the run immediately instead of spending the usual empty-turn retry.
+  assert.equal(run.annotateTurns(), 1);
+  assert.equal(run.sessionsOpened(), 1);
+
+  assert.match(run.stderr, /made no changes to the staging copy during the edit turn/);
+  assert.doesNotMatch(run.stderr, /no output, in the run's session and again in a fresh one/);
+  assert.match(run.stderr, /run `backpass propose` again, or pin a different harness with --synthesis-agent/);
+
+  assert.ok(!fs.existsSync(path.join(dir, ".backpass", "proposal.json")), "no proposal was saved");
+});
+
+test("an edit turn that only writes a stray out-of-scope file is not mistaken for an untouched staging copy", () => {
+  const dir = makeCliRepo({ memory: MEMORY });
+  const run = runCli(dir, ["propose", ...PIN], {
+    script: {
+      edit: { "scratch.txt": "notes left behind by the edit turn" },
+      annotations: [{ empty: true }, { empty: true }],
+    },
+  });
+
+  assert.equal(run.status, 1, `the run should fail:\n${run.output}`);
+  assert.equal(
+    run.sessionsOpened(),
+    2,
+    "a stray-only edit still counts as touched, so the usual empty-turn retry runs instead of an immediate edit-empty",
+  );
+  assert.match(run.stderr, /no output, in the run's session and again in a fresh one/);
+  assert.doesNotMatch(run.stderr, /made no changes to the staging copy during the edit turn/);
 });
 
 test("a rejected proposal's notes are printed with the failure", () => {

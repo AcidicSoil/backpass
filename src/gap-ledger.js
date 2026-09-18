@@ -60,11 +60,72 @@ export function emptyGapLedger() {
   return { version: 1, entries: {} };
 }
 
+/**
+ * Fold-issued source label for one session. Evidence floors, `summary.sources`, and
+ * `sourceProjects` all key off this string, so it must not collapse two sessions.
+ * Time-prefixed Codex ULIDs share an 8-character prefix when they start in the same
+ * minute; keep the native id whole.
+ *
+ * A session collected over ssh carries its host, so the apply surface shows what
+ * cross-machine corroboration actually is: two machines hitting one gap, named.
+ */
 export function gapSource(transcript = {}) {
   const date = transcript.startedAt ? new Date(transcript.startedAt).toISOString().slice(0, 10) : "unknown date";
-  return `${transcript.harness} · ${String(transcript.id || "")
-    .replace(/^[a-z-]+-/, "")
-    .slice(0, 8)} · ${date}`;
+  const host = transcript.host ? ` · ${transcript.host}` : "";
+  return `${transcript.harness} · ${sessionSourceId(transcript)} · ${date}${host}`;
+}
+
+export function sessionSourceId(transcript = {}) {
+  const native = String(transcript.nativeId ?? "").trim();
+  if (native) return native;
+  const raw = String(transcript.id || "").trim();
+  const harness = String(transcript.harness || "");
+  if (harness && raw.startsWith(`${harness}-`)) return raw.slice(harness.length + 1);
+  return raw.replace(/^[a-z-]+-/, "") || String(transcript.identity || "").trim();
+}
+
+export function normalizeSourceLabel(source) {
+  return String(source || "")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+/**
+ * When two sessions share a base source label, suffix the canonical session identity
+ * so `summary.sources` and `sourceProjects` stay 1:1 with sessions instead of
+ * last-write-wins on the colliding key.
+ *
+ * @param {{ source?: string, identity?: string }[]} entries
+ * @returns {string[]}
+ */
+export function disambiguateSourceLabels(entries) {
+  const normalized = (Array.isArray(entries) ? entries : []).map((entry) => ({
+    source: normalizeSourceLabel(entry?.source),
+    identity: String(entry?.identity || "").trim(),
+  }));
+  const sourceByIdentity = new Map();
+  for (const entry of normalized) {
+    if (entry.identity && entry.source && !sourceByIdentity.has(entry.identity)) {
+      sourceByIdentity.set(entry.identity, entry.source);
+    }
+  }
+  const canonical = normalized.map((entry) => ({
+    ...entry,
+    source: sourceByIdentity.get(entry.identity) || entry.source,
+  }));
+  const identitiesBySource = new Map();
+  for (const entry of canonical) {
+    if (!entry.source) continue;
+    if (!identitiesBySource.has(entry.source)) identitiesBySource.set(entry.source, new Set());
+    identitiesBySource.get(entry.source).add(entry.identity || entry.source);
+  }
+  return canonical.map((entry) => {
+    const identities = identitiesBySource.get(entry.source);
+    if (identities?.size > 1 && entry.identity && !entry.source.includes(entry.identity)) {
+      return `${entry.source} · ${entry.identity}`;
+    }
+    return entry.source;
+  });
 }
 
 function normalize(text) {
@@ -155,6 +216,14 @@ export function recordGapObservations(ledger, evidenceRecords, options = {}) {
       if (aliasPrior) delete entry.sessions[transcript.id];
       const coveredBySkill =
         gap.coveredBySkill || priors.find((observation) => observation.coveredBySkill)?.coveredBySkill;
+      const phrasings = [
+        ...new Set([
+          ...priors.flatMap(
+            (observation) => observation.phrasings || [observation.proposedInstruction].filter(Boolean),
+          ),
+          gap.proposedInstruction,
+        ]),
+      ];
       entry.sessions[sessionIdentity] = {
         firstObservedAt: firstObservedAt || observedAt,
         observedAt,
@@ -165,11 +234,14 @@ export function recordGapObservations(ledger, evidenceRecords, options = {}) {
         mistake: gap.mistake,
         quote: gap.quote,
         recurrenceRisk: gap.recurrenceRisk,
+        phrasings,
         domain: gap.domain === "orchestration" ? "orchestration" : "project",
         // A failed trigger: the analysis judged an existing skill's content to cover
         // this mistake. Absent when no skill covers it (including all pre-existing
         // observations), and absence never counts as a citation.
         ...(coveredBySkill ? { coveredBySkill } : {}),
+        ...(transcript.project ? { project: transcript.project } : {}),
+        ...(transcript.projectRoot ? { projectRoot: transcript.projectRoot } : {}),
       };
       recorded += 1;
     }
@@ -246,6 +318,7 @@ export function ledgerGapObservations(ledger, memoryPath, skills = null) {
     for (const [sessionId, obs] of Object.entries(entry.sessions)) {
       observations.push({
         proposedInstruction: entry.proposedInstruction,
+        phrasings: obs.phrasings?.length ? obs.phrasings : [entry.proposedInstruction],
         sessionId,
         source: obs.source,
         mistake: obs.mistake,
@@ -255,6 +328,8 @@ export function ledgerGapObservations(ledger, memoryPath, skills = null) {
         ...(obs.coveredBySkill && (!skillNames || skillNames.has(obs.coveredBySkill))
           ? { coveredBySkill: obs.coveredBySkill }
           : {}),
+        ...(obs.project ? { project: obs.project } : {}),
+        ...(obs.projectRoot ? { projectRoot: obs.projectRoot } : {}),
       });
     }
   }
@@ -311,6 +386,14 @@ export function mergeGapEntries(ledger, groups) {
           if (earlier) prior.firstObservedAt = obs.firstObservedAt || obs.observedAt;
           if (prior.domain === "orchestration" && obs.domain !== "orchestration") prior.domain = "project";
           if (!prior.coveredBySkill && obs.coveredBySkill) prior.coveredBySkill = obs.coveredBySkill;
+          if (!prior.project && obs.project) prior.project = obs.project;
+          if (!prior.projectRoot && obs.projectRoot) prior.projectRoot = obs.projectRoot;
+          prior.phrasings = [
+            ...new Set([
+              ...(prior.phrasings || [target.proposedInstruction]),
+              ...(obs.phrasings || [entry.proposedInstruction]),
+            ]),
+          ];
         }
       }
       target.aliases = [...new Set([...(target.aliases || []), entry.id, ...(entry.aliases || [])])];

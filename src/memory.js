@@ -1,8 +1,10 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 import { sha256 } from "./state.js";
 import { estimateTokens } from "./tokens.js";
+import { UserError } from "./logger.js";
 
 /**
  * Memory files are the weights. To talk about them precisely, backpass parses each
@@ -293,8 +295,66 @@ export function memoryTextHash(text) {
   return `sha256:${sha256(text).slice(0, 16)}`;
 }
 
-export function readMemoryFile(repoRoot, relativePath) {
-  const absolute = path.join(repoRoot, relativePath);
+export function resolveMemoryPath(repoRoot, configuredPath, { allowExternal = false } = {}) {
+  const expanded =
+    configuredPath === "~" || configuredPath.startsWith("~/")
+      ? path.join(os.homedir(), configuredPath.slice(configuredPath === "~" ? 1 : 2))
+      : configuredPath;
+  const root = path.resolve(repoRoot);
+  const absolute = path.resolve(root, expanded);
+  if (!allowExternal) {
+    let existing = absolute;
+    while (!fs.existsSync(existing) && path.dirname(existing) !== existing) existing = path.dirname(existing);
+    let realRoot;
+    let realExisting;
+    try {
+      realRoot = fs.realpathSync(root);
+      realExisting = fs.realpathSync(existing);
+    } catch {
+      realRoot = root;
+      realExisting = existing;
+    }
+    const resolved = path.resolve(realExisting, path.relative(existing, absolute));
+    const relative = path.relative(realRoot, resolved);
+    if (relative.startsWith("..") || path.isAbsolute(relative)) {
+      throw new UserError(`${configuredPath} resolves outside the project root; project scope cannot access it`);
+    }
+  }
+  return absolute;
+}
+
+/**
+ * Where a write to `absolute` would really land when that is somewhere else and cannot be
+ * written - a skill linked into a nix or home-manager store, typically. The probe refuses
+ * when the directory the resolved location sits in is unwritable, whether the link is a
+ * directory on the way to the file or the file itself. For a leaf link that is stricter
+ * than `atomicReplace` strictly needs - it renames into the link's own parent, which may
+ * be writable - and deliberately so: that rename would swap the link for a private copy
+ * and leave the store source behind, silently unlinking the file from what generates it.
+ * The resolved file's own mode never decides, because no write path opens it for writing.
+ *
+ * `null` means the write can land, and deliberately covers the undecidable cases too - an
+ * unresolvable path, a broken link, a racing rename. A probe that cannot establish that a
+ * file is unwritable never decides against it; the apply gate remains the backstop.
+ */
+export function readOnlyResolvedPath(absolute) {
+  let real;
+  try {
+    real = fs.realpathSync(absolute);
+  } catch {
+    return null;
+  }
+  if (real === path.resolve(absolute)) return null;
+  try {
+    fs.accessSync(path.dirname(real), fs.constants.W_OK | fs.constants.X_OK);
+    return null;
+  } catch {
+    return real;
+  }
+}
+
+export function readMemoryFile(repoRoot, relativePath, options = {}) {
+  const absolute = resolveMemoryPath(repoRoot, relativePath, options);
   if (!fs.existsSync(absolute)) return null;
   const text = fs.readFileSync(absolute, "utf8");
   return {
@@ -308,8 +368,8 @@ export function readMemoryFile(repoRoot, relativePath) {
 }
 
 /** Load every configured memory file that actually exists in the repo. */
-export function loadMemoryFiles(repoRoot, memoryFiles) {
-  return memoryFiles.map((f) => readMemoryFile(repoRoot, f)).filter(Boolean);
+export function loadMemoryFiles(repoRoot, memoryFiles, options = {}) {
+  return memoryFiles.map((f) => readMemoryFile(repoRoot, f, options)).filter(Boolean);
 }
 
 /** Combined hash across all memory files - the "weights version" evidence is keyed to. */
@@ -423,15 +483,33 @@ export function reanchor(reference, file, threshold = 0.6) {
  * A file is a pointer to `target` when, ignoring blank lines and HTML comments, its
  * only content is the import line (`@AGENTS.md` or `@./AGENTS.md`).
  */
-export function isPointerTo(text, target) {
+export function pointerImportPath(text, options = {}) {
   const lines = text
     .replace(/<!--[\s\S]*?-->/g, "")
     .split("\n")
     .map((l) => l.trim())
     .filter(Boolean);
-  if (lines.length !== 1) return false;
-  const ref = lines[0].replace(/^@\.\//, "@");
-  return ref === `@${target}`;
+  if (lines.length !== 1) return null;
+  const imported = lines[0].replace(/^@\.\//, "@");
+  if (!imported.startsWith("@")) return null;
+
+  const spec = imported.slice(1);
+  const home = options.home || os.homedir();
+  const fromDir = options.fromDir || options.root || "";
+  const expanded = spec === "~" ? home : spec.startsWith("~/") ? path.join(home, spec.slice(2)) : spec;
+  return path.isAbsolute(expanded) ? expanded : path.resolve(fromDir || ".", expanded);
+}
+
+export function isPointerTo(text, target, options = {}) {
+  const resolvedSpec = pointerImportPath(text, options);
+  if (!resolvedSpec) return false;
+  const home = options.home || os.homedir();
+  const expandedTarget = target === "~" ? home : target.startsWith("~/") ? path.join(home, target.slice(2)) : target;
+  const fromDir = options.fromDir || options.root || "";
+  const resolvedTarget = path.isAbsolute(expandedTarget)
+    ? expandedTarget
+    : path.resolve(fromDir || ".", expandedTarget);
+  return resolvedSpec === resolvedTarget;
 }
 
 /**
@@ -445,11 +523,15 @@ export function isPointerTo(text, target) {
  * The weights hash still covers every existing file, as before, so cached evidence
  * survives this resolution unchanged.
  */
-export function resolveMemoryFiles(repoRoot, memoryFiles) {
-  const files = loadMemoryFiles(repoRoot, memoryFiles);
+export function resolveMemoryFiles(repoRoot, memoryFiles, options = {}) {
+  const files = loadMemoryFiles(repoRoot, memoryFiles, options);
   if (!files.length) return { primary: null, all: files, pointers: [], separate: [], hash: null };
   const [primary, ...others] = files;
-  const pointers = others.filter((f) => isPointerTo(f.text, primary.path));
+  const pointers = others.filter(
+    (f) =>
+      path.basename(f.absolute).toLowerCase() === "claude.md" &&
+      isPointerTo(f.text, primary.absolute, { fromDir: path.dirname(f.absolute) }),
+  );
   const separate = others.filter((f) => !pointers.includes(f));
   return { primary, all: files, pointers, separate, hash: memorySetHash(files) };
 }

@@ -3,6 +3,7 @@ import path from "node:path";
 import os from "node:os";
 
 import { UserError, warn } from "./logger.js";
+import { normalizeSkillsDir } from "./skills.js";
 
 export const CONFIG_FILENAME = ".backpassrc.json";
 export const STATE_DIRNAME = ".backpass";
@@ -84,6 +85,14 @@ export const DEFAULT_CONFIG = {
      */
     cloneRoots: [],
     chatgptExports: [],
+    /**
+     * SSH destinations whose harness stores this run also collects from
+     * (`src/discovery/hosts.js`). Personal configuration only: a repository file that
+     * sets it is refused by name, so a checked-in config can never point a
+     * contributor's backpass at a machine. Entries are an ssh destination string, or
+     * `{ host, node, env, harnesses, connectTimeoutSeconds }`.
+     */
+    hosts: [],
     minUserTurns: 2,
     includeCursorIde: false,
   },
@@ -94,9 +103,60 @@ export const DEFAULT_CONFIG = {
   theme: "auto",
 };
 
-function userConfigPath() {
+/**
+ * User-scope defaults, layered on `DEFAULT_CONFIG` when `--scope user`.
+ *
+ * Canonical user memory is the first existing file in this list (captain, issue #97):
+ * `~/.agents/AGENTS.md` first (AGENTS.md is the cross-harness file), then Claude Code's
+ * configured `CLAUDE.md` (allowed as a pointer), then Codex's configured `AGENTS.md`.
+ * `CLAUDE_CONFIG_DIR` and `CODEX_HOME` relocate the latter two defaults.
+ * `minGapProjects` defaults to 1: the gate exists and is configurable, but cross-project
+ * corroboration is not required. Phase 1 discovery and user-level edit targets cover
+ * Claude Code and Codex (plus the shared `.agents` layout).
+ */
+export const USER_MEMORY_FILES = [".agents/AGENTS.md", ".claude/CLAUDE.md", ".codex/AGENTS.md"];
+export const USER_SKILLS_DIRS = [".agents/skills", ".claude/skills", ".codex/skills"];
+
+export function userClaudeSkillsDir() {
+  return path.join(process.env.CLAUDE_CONFIG_DIR || ".claude", "skills");
+}
+
+function userHarnessPaths() {
+  const claudeRoot = process.env.CLAUDE_CONFIG_DIR || ".claude";
+  const codexRoot = process.env.CODEX_HOME || ".codex";
+  return {
+    memoryFiles: [".agents/AGENTS.md", path.join(claudeRoot, "CLAUDE.md"), path.join(codexRoot, "AGENTS.md")],
+    skillsDirs: [".agents/skills", userClaudeSkillsDir(), path.join(codexRoot, "skills")],
+  };
+}
+
+export const USER_CONFIG_DEFAULTS = {
+  memoryFiles: USER_MEMORY_FILES,
+  skillsDir: ".agents/skills",
+  skillsDirs: USER_SKILLS_DIRS,
+  minGapProjects: 1,
+  discovery: {
+    harnesses: ["claude", "codex"],
+    includeProjects: [],
+    excludeProjects: [],
+    maxTranscriptsPerProject: null,
+  },
+};
+
+export function parseScopeKind(value) {
+  if (value === undefined || value === null || value === "") return "project";
+  if (value === "project" || value === "user") return value;
+  throw new UserError(`--scope must be "project" or "user" (got "${value}")`);
+}
+
+export function userConfigPath() {
   const base = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
   return path.join(base, "backpass", "config.json");
+}
+
+/** Isolated user-scope state: `~/.config/backpass/user/` (honours `XDG_CONFIG_HOME`). */
+export function userStateDir() {
+  return path.join(path.dirname(userConfigPath()), "user");
 }
 
 function readJsonIfPresent(file) {
@@ -163,7 +223,7 @@ export function sinceCutoff(since, now = Date.now()) {
   return window === null ? null : now - window;
 }
 
-function validate(config) {
+function validate(config, { kind = "project" } = {}) {
   if (!Array.isArray(config.memoryFiles) || config.memoryFiles.length === 0) {
     throw new UserError("config.memoryFiles must be a non-empty array");
   }
@@ -175,6 +235,38 @@ function validate(config) {
   }
   if (!Number.isInteger(config.minGapEvidence) || config.minGapEvidence < 1) {
     throw new UserError("config.minGapEvidence must be an integer >= 1");
+  }
+  if (kind === "user" || config.minGapProjects !== undefined) {
+    const minGapProjects = config.minGapProjects ?? 1;
+    if (!Number.isInteger(minGapProjects) || minGapProjects < 1) {
+      throw new UserError("config.minGapProjects must be an integer >= 1");
+    }
+    config.minGapProjects = minGapProjects;
+  }
+  if (config.skillsDirs !== undefined) {
+    if (!Array.isArray(config.skillsDirs) || config.skillsDirs.some((d) => typeof d !== "string")) {
+      throw new UserError("config.skillsDirs must be an array of paths");
+    }
+  }
+  const includeProjects = config.discovery.includeProjects;
+  const excludeProjects = config.discovery.excludeProjects;
+  if (
+    includeProjects !== undefined &&
+    (!Array.isArray(includeProjects) || includeProjects.some((g) => typeof g !== "string"))
+  ) {
+    throw new UserError("config.discovery.includeProjects must be an array of globs");
+  }
+  if (
+    excludeProjects !== undefined &&
+    (!Array.isArray(excludeProjects) || excludeProjects.some((g) => typeof g !== "string"))
+  ) {
+    throw new UserError("config.discovery.excludeProjects must be an array of globs");
+  }
+  const maxPerProject = config.discovery.maxTranscriptsPerProject;
+  if (maxPerProject != null) {
+    if (!Number.isInteger(maxPerProject) || maxPerProject < 1) {
+      throw new UserError("config.discovery.maxTranscriptsPerProject must be a positive integer or null");
+    }
   }
   config.maxTranscripts = parseMaxTranscripts(config.maxTranscripts, "config.maxTranscripts");
   try {
@@ -234,24 +326,89 @@ function validate(config) {
       "pass --chatgpt-export <path>, or set discovery.chatgptExports in .backpassrc.json",
     );
   }
+  if (config.discovery.hosts !== undefined && !Array.isArray(config.discovery.hosts)) {
+    throw new UserError("config.discovery.hosts must be an array of ssh destinations");
+  }
   return config;
 }
 
 /**
- * Layered config: defaults < ~/.config/backpass/config.json < <repo>/.backpassrc.json < CLI flags.
+ * A repository may not name a machine.
+ *
+ * `.backpassrc.json` is checked in and shared, so a `discovery.hosts` there would let one
+ * contributor point every other contributor's backpass at a host - which is exactly the
+ * "someone else's transcripts" the vision resists. Hosts are personal configuration and
+ * live in the person's own global file, or on the command line for one run.
  */
-export function loadConfig(repoRoot, overrides = {}) {
-  const merged = [
-    readJsonIfPresent(userConfigPath()),
-    readJsonIfPresent(path.join(repoRoot, CONFIG_FILENAME)),
-    overrides,
-  ].reduce((acc, layer) => (layer ? deepMerge(acc, layer) : acc), DEFAULT_CONFIG);
+function refuseRepoHosts(repoFile, file) {
+  if (!repoFile?.discovery || repoFile.discovery.hosts === undefined) return;
+  throw new UserError(
+    `${file} sets discovery.hosts, but ssh hosts are personal configuration`,
+    `move them to ${userConfigPath()}, or pass --host <destination> for one run`,
+  );
+}
+
+/**
+ * Layered config.
+ *
+ * Project: defaults < ~/.config/backpass/config.json (minus its `user` block) <
+ *   <repo>/.backpassrc.json < CLI flags.
+ * User: defaults < user-scope defaults < ~/.config/backpass/config.json `user` block <
+ *   CLI flags. `.backpassrc.json` is never read.
+ *
+ * `discovery.hosts` is the one setting a repository file may not carry at all
+ * (`refuseRepoHosts`). In user scope it defaults to the global file's top-level list, so
+ * a person names their machines once rather than once per scope.
+ */
+export function loadConfig(repoRoot, overrides = {}, { kind = "project" } = {}) {
+  const scopeKind = parseScopeKind(kind);
+  let merged;
+  if (scopeKind === "user") {
+    const globalFile = readJsonIfPresent(userConfigPath());
+    const userBlock = isPlainObject(globalFile?.user) ? globalFile.user : {};
+    const harnessPaths = userHarnessPaths();
+    merged = [DEFAULT_CONFIG, { ...USER_CONFIG_DEFAULTS, ...harnessPaths }, userBlock, overrides].reduce(
+      (acc, layer) => (layer ? deepMerge(acc, layer) : acc),
+      {},
+    );
+    if (userBlock.discovery?.hosts === undefined && overrides.discovery?.hosts === undefined) {
+      merged.discovery.hosts = globalFile?.discovery?.hosts ?? DEFAULT_CONFIG.discovery.hosts;
+    }
+  } else {
+    const globalFile = readJsonIfPresent(userConfigPath());
+    const projectGlobal = globalFile ? { ...globalFile } : null;
+    if (projectGlobal) delete projectGlobal.user;
+    const repoFile = repoRoot ? readJsonIfPresent(path.join(repoRoot, CONFIG_FILENAME)) : null;
+    refuseRepoHosts(repoFile, repoRoot ? path.join(repoRoot, CONFIG_FILENAME) : CONFIG_FILENAME);
+    merged = [projectGlobal, repoFile, overrides].reduce(
+      (acc, layer) => (layer ? deepMerge(acc, layer) : acc),
+      DEFAULT_CONFIG,
+    );
+  }
 
   const config = structuredClone(merged);
+  config.skillsDir = normalizeSkillsDir(config.skillsDir);
   if (config.discovery.includeCursorIde && !config.discovery.harnesses.includes("cursor-ide")) {
     config.discovery.harnesses = [...config.discovery.harnesses, "cursor-ide"];
   }
-  return validate(config);
+  return validate(config, { kind: scopeKind });
+}
+
+/**
+ * `--host` adds a destination to this run's list; `--host none` collects locally only.
+ * It adds rather than replaces because the flag is for "also look over there today",
+ * and the one case that needs replacing - skip everything configured - has its own word.
+ */
+export function applyHostFlag(configured, flagValues) {
+  if (!flagValues?.length) return configured;
+  const named = flagValues.map((value) => String(value));
+  if (named.includes("none")) return [];
+  const out = [...(configured || [])];
+  for (const host of named) {
+    const already = out.some((entry) => (typeof entry === "string" ? entry : entry?.host) === host);
+    if (!already) out.push(host);
+  }
+  return out;
 }
 
 export function repoConfigPath(repoRoot) {
@@ -267,10 +424,26 @@ export function initialConfig() {
     // maxEditsPerRun stays unset so the adaptive cap applies; set it to pin a number.
     minGapEvidence: DEFAULT_CONFIG.minGapEvidence,
     maxTranscripts: DEFAULT_CONFIG.maxTranscripts,
-    // Agents stay unset so the ladder auto-pick keeps applying to initialized repos.
-    analysis: { agent: null, model: null, effort: null },
-    synthesis: { agent: null, model: null, effort: null },
+    // Agent roles stay unset so initialized repos inherit global pins, or the default
+    // auto-pick when no global pin exists.
     discovery: { harnesses: ALL_HARNESSES, since: "30d", worktreeGlobs: [], minUserTurns: 2 },
     jobs: DEFAULT_CONFIG.jobs,
+  };
+}
+
+/** The `user` block written by `backpass init --scope user`. */
+export function initialUserConfig() {
+  return {
+    skillsDir: USER_CONFIG_DEFAULTS.skillsDir,
+    budgetTokens: DEFAULT_CONFIG.budgetTokens,
+    minGapEvidence: DEFAULT_CONFIG.minGapEvidence,
+    minGapProjects: USER_CONFIG_DEFAULTS.minGapProjects,
+    discovery: {
+      harnesses: USER_CONFIG_DEFAULTS.discovery.harnesses,
+      since: "30d",
+      includeProjects: [],
+      excludeProjects: [],
+      maxTranscriptsPerProject: null,
+    },
   };
 }

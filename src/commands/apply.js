@@ -5,6 +5,7 @@ import { closeApplySurface, openApplySurface, pollDecisions, renderApplySurface 
 import { reviewInTerminal } from "../apply/terminal.js";
 import { openInBrowser } from "../apply/browser.js";
 import { budgetBar, formatTokens } from "../tokens.js";
+import { describeTarget } from "../target.js";
 
 /**
  * The human gate. `backpass apply` is the only command that writes to the repo.
@@ -14,6 +15,12 @@ import { budgetBar, formatTokens } from "../tokens.js";
  * terminal. `applyDecisions` owns the pre-write freshness, budget, and composition gates;
  * a failing gate records no rejections.
  */
+/** A run-level failure carries no `file`; only a per-edit one does. */
+export function formatFailureLine(failure) {
+  const location = failure.file ? ` ${failure.file}${failure.edit ? ` (${failure.edit})` : ""}` : "";
+  return `${color.red("failed")}${location}: ${failure.error}`;
+}
+
 export async function cmdApply(ctx) {
   const { config, repo } = ctx;
   const proposal = config.state.readProposal();
@@ -21,6 +28,21 @@ export async function cmdApply(ctx) {
   if (!proposal) {
     throw new UserError("no proposal to apply", "run `backpass` first to produce one");
   }
+  const proposalScope = proposal.scope || "project";
+  const runScope = ctx.scope?.kind || "project";
+  if (proposalScope !== runScope) {
+    throw new UserError(`this proposal is ${proposalScope} scope; run \`backpass apply --scope ${proposalScope}\``);
+  }
+  // A proposal carries its own target; the flag on apply may only restate it.
+  const savedTarget = proposal.target || { kind: "surface" };
+  const sameTarget = config.target.kind === savedTarget.kind && config.target.path === savedTarget.path;
+  if (ctx.flags.target !== undefined && !sameTarget) {
+    throw new UserError(
+      `this proposal targets ${describeTarget(savedTarget)}, not ${describeTarget(config.target)}`,
+      "apply it without --target, or run backpass again with the target you want",
+    );
+  }
+  if (savedTarget.kind !== "surface") info(`${color.cyan("·")} proposal targets ${describeTarget(savedTarget)}`);
   if (proposal.violations?.length) {
     throw new UserError(
       "the saved proposal failed its mechanical gates and was never approved for apply",
@@ -97,7 +119,7 @@ export async function cmdApply(ctx) {
   }
   for (const warning of results.warnings || []) warn(warning);
   for (const failure of results.failed) {
-    out(`  ${color.red("failed")} ${failure.file}${failure.edit ? ` (${failure.edit})` : ""}: ${failure.error}`);
+    out(`  ${formatFailureLine(failure)}`);
   }
 
   if (results.rejectionsRecorded) {
