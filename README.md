@@ -85,8 +85,9 @@ Canonical user memory is the first existing file in this order: `~/.agents/AGENT
 `$CLAUDE_CONFIG_DIR/CLAUDE.md` (default `~/.claude/CLAUDE.md`), and
 `$CODEX_HOME/AGENTS.md` (default `~/.codex/AGENTS.md`). User-level skill extractions
 default to `~/.agents/skills`, with a warning if Claude's active `skills` path is a
-real directory rather than the usual symlink. See [Configuration](#configuration) for
-using an existing harness-loaded directory instead.
+real directory rather than the usual symlink. Backpass leaves that directory untouched:
+see [Configuration](#configuration) for the scope-specific settings and manual merge
+guidance.
 
 In user scope every `add`, `rewrite`, or `remove` edit also clears `minGapProjects`
 (default `1`): the distinct projects behind its own quotes, counted from the gap
@@ -735,8 +736,13 @@ regular settings; its path and user-only settings include `memoryFiles`, `skills
 `skillsDirs`, `minGapProjects` (default `1`), and these discovery controls:
 
 `skillsDir` defaults to `.agents/skills`. To use an existing harness-loaded directory
-instead, such as `.claude/skills`, configure that path; a missing configured directory
-falls back to the default. Backpass normalizes path separators and trailing slashes.
+instead, such as `.claude/skills`, configure that path: use `--skills-dir <path>` for one
+run, `skillsDir` in `.backpassrc.json` for project scope, or `skillsDir` under the `user`
+block in `$XDG_CONFIG_HOME/backpass/config.json` (default `~/.config/backpass/config.json`)
+for user scope. A missing configured directory falls back to the default. Backpass leaves
+a real `.claude/skills` directory untouched and recommends manually merging new skill
+directories after checking for conflicts. It never recommends replacing that directory
+with a symlink. Backpass normalizes path separators and trailing slashes.
 
 ```json
 {

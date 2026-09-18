@@ -229,6 +229,11 @@ test("a real .claude/skills directory is warned about and never clobbered", () =
   assert.equal(resolved.dir, CANONICAL_SKILLS_DIR);
   assert.equal(resolved.warnings.length, 1);
   assert.match(resolved.warnings[0], /\.claude\/skills is a real directory/);
+  assert.match(resolved.warnings[0], /--skills-dir '\.claude\/skills'/);
+  assert.match(resolved.warnings[0], /"skillsDir": "\.claude\/skills"/);
+  assert.match(resolved.warnings[0], /"user" block in \$XDG_CONFIG_HOME\/backpass\/config\.json/);
+  assert.match(resolved.warnings[0], /merge new skill directories manually/);
+  assert.doesNotMatch(resolved.warnings[0], /ln -s|replace it/);
 
   const result = writeSkill(root, SKILL);
   assert.equal(result.warnings.length, 1);
@@ -238,6 +243,21 @@ test("a real .claude/skills directory is warned about and never clobbered", () =
   assert.equal(fs.readFileSync(existing, "utf8").includes("keep me"), true);
   assert.ok(!fs.existsSync(path.join(root, CLAUDE_SKILLS_LINK, "release-signing")));
   assert.ok(fs.existsSync(path.join(root, CANONICAL_SKILLS_DIR, "release-signing", "SKILL.md")));
+});
+
+test("quotes spaces in the one-run skills directory guidance", () => {
+  const root = tmpRepo();
+  const claudeSkillsDir = ".claude config/skills";
+  fs.mkdirSync(path.join(root, claudeSkillsDir), { recursive: true });
+
+  const resolved = resolveOverflowTarget(root, CANONICAL_SKILLS_DIR, { claudeSkillsDir });
+
+  assert.equal(resolved.warnings.length, 1);
+  assert.match(resolved.warnings[0], /--skills-dir '\.claude config\/skills'/);
+  assert.match(resolved.warnings[0], /project scope/);
+  assert.match(resolved.warnings[0], /user.*scope/);
+  assert.match(resolved.warnings[0], /merge new skill directories manually after checking for conflicts/);
+  assert.doesNotMatch(resolved.warnings[0], /ln -s|replace it/);
 });
 
 test("applyDecisions writes accepted extractions through the skills layout and surfaces warnings", () => {
