@@ -18,6 +18,7 @@ import { cmdPropose } from "./commands/propose.js";
 import { cmdApply } from "./commands/apply.js";
 import { cmdStatus } from "./commands/status.js";
 import { cmdRun } from "./commands/run.js";
+import { cmdImprovements } from "./commands/improvements.js";
 
 const PKG = JSON.parse(
   fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "package.json"), "utf8"),
@@ -58,6 +59,7 @@ const OPTIONS = {
   "synthesis-agent": { type: "string" },
   "synthesis-model": { type: "string" },
   "synthesis-effort": { type: "string" },
+  "pab-url": { type: "string" },
 
   "dry-run": { type: "boolean" },
   "no-ui": { type: "boolean" },
@@ -82,6 +84,7 @@ COMMANDS
              gradient descent. Never writes.
   scan       collect samples only: which transcripts belong to this repo, and how we know
   analyze    calculate loss: one cheap model call per new transcript (tier 1)
+  improvements  export/submit saved evidence-backed proposals to PAB (no model calls)
   propose    aggregate gradients, then high-reasoning gradient descent
              turning the aggregated evidence into edits (tier 2)
   apply      review the proposal and write the accepted edits (the only writer)
@@ -118,6 +121,7 @@ MODELS (two-tier: cheap analysis, smart synthesis - all through acpx)
   --synthesis-effort <e>   one-off reasoning effort for synthesis            [high]
   --no-auto-agent          skip the ladders and pin codex / claude (the pre-0.2 defaults)
   --jobs <n>               parallel analysis calls                      [4]
+  --pab-url <loopback>      deliver new and saved proposals to PAB for review
 
 BUDGET AND SHAPE
   --budget <tokens>        always-loaded budget per memory file         [5000]
@@ -229,6 +233,7 @@ const COMMANDS = {
   scan: cmdScan,
   analyze: cmdAnalyze,
   propose: cmdPropose,
+  improvements: cmdImprovements,
   apply: cmdApply,
   status: cmdStatus,
   run: cmdRun,
@@ -293,16 +298,19 @@ export async function main(argv) {
     config.memoryFiles = config.target.kind === "memory" ? [config.target.path] : scope.memoryFiles;
     config.skillsDir = scope.overflowDir;
     if (scope.skillDirs.length) config.skillsDirs = scope.skillDirs;
-    config.state = new State(scope.root, {
+    const state = new State(scope.root, {
       stateDir: scope.stateDir,
       mode: kind === "user" ? 0o700 : undefined,
       exclude: kind === "user" ? false : undefined,
-    }).ensure();
-    config.agents = new AgentResolver(config, {
-      state: config.state,
-      cwd: scope.modelCwd,
-      bypassCache: Boolean(values.force),
     });
+    config.state = commandName === "improvements" ? state : state.ensure();
+    if (commandName !== "improvements") {
+      config.agents = new AgentResolver(config, {
+        state: config.state,
+        cwd: scope.modelCwd,
+        bypassCache: Boolean(values.force),
+      });
+    }
 
     const ctx = {
       repo: scope.repo,

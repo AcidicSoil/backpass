@@ -83,6 +83,17 @@ backpass scan --chatgpt-export ~/.wiki/Nexus/Conversations/chatgpt --since all -
 backpass --chatgpt-export ~/.wiki/Nexus/Conversations/chatgpt --since all
 ```
 
+### Export a saved proposal to PAB
+
+`backpass improvements --json` reads `.backpass/proposal.json` and prints evidence-backed
+project incidents without running an agent, modifying the target, or contacting PAB.
+To submit them for matching and review, use `backpass improvements --pab-url
+http://127.0.0.1:<port>`. Set `BACKPASS_PAB_URL` or pass `--pab-url` to opt new
+`backpass` and `backpass propose` runs into automatic submission. Automatic delivery
+is fail-soft: a PAB outage does not discard the saved proposal. The intake is
+idempotent by incident content and does not approve implementation. User-scope,
+rejected, evidence-free, and unsafe or missing file targets are not exported.
+
 ### User-level memory
 
 A run is one scope. The default is the checkout you are in. `backpass --scope user`
