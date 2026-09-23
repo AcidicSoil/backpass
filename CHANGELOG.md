@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.26](https://github.com/kunchenguid/backpass/compare/backpass-v0.1.25...backpass-v0.1.26) (2026-09-21)
+
+
+### Features
+
+* **config:** add skillSearchPaths for read-only awareness of shared skill libraries ([#138](https://github.com/kunchenguid/backpass/issues/138)) ([2bade32](https://github.com/kunchenguid/backpass/commit/2bade325f15b0fb0ed087245e045a6979961f738))
+
+## [0.1.25](https://github.com/kunchenguid/backpass/compare/backpass-v0.1.24...backpass-v0.1.25) (2026-09-18)
+
+
+### Bug Fixes
+
+* **skills:** preserve real Claude skills directories ([#136](https://github.com/kunchenguid/backpass/issues/136)) ([158dcd6](https://github.com/kunchenguid/backpass/commit/158dcd6343291d90f4eb3119402aa58dcf128326))
+
 ## [0.1.24](https://github.com/kunchenguid/backpass/compare/backpass-v0.1.23...backpass-v0.1.24) (2026-09-16)
 
 
