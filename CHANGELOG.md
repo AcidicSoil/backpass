@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.28](https://github.com/kunchenguid/backpass/compare/backpass-v0.1.27...backpass-v0.1.28) (2026-09-25)
+
+
+### Bug Fixes
+
+* **redact:** stop secret redaction from eating benign tool arguments ([#153](https://github.com/kunchenguid/backpass/issues/153)) ([7bd9150](https://github.com/kunchenguid/backpass/commit/7bd9150cf281cb56fc8e7cae1441a7a7fd26f042))
+
+## [0.1.27](https://github.com/kunchenguid/backpass/compare/backpass-v0.1.26...backpass-v0.1.27) (2026-09-24)
+
+
+### Bug Fixes
+
+* **acpx:** report acpx budget kills as timeouts, not empty-output ([#145](https://github.com/kunchenguid/backpass/issues/145)) ([b295a2d](https://github.com/kunchenguid/backpass/commit/b295a2d1d999fa5272e498176dd2cfce752e094b))
+
 ## [0.1.26](https://github.com/kunchenguid/backpass/compare/backpass-v0.1.25...backpass-v0.1.26) (2026-09-21)
 
 
