@@ -1,5 +1,4 @@
 import { consolidateGapLedger } from "../consolidate.js";
-import { publishIfConfigured } from "./improvements.js";
 import { foldEvidence } from "../fold.js";
 import { ledgerGapObservations, pruneGapLedger, recordGapObservations } from "../gap-ledger.js";
 import { synthesizeProposal } from "../synthesize.js";
@@ -147,7 +146,6 @@ async function runProposalCore(ctx, precomputed) {
 
   accountForConsolidationUsage(proposal, summary);
   config.state.writeProposal(proposal);
-  await publishIfConfigured(proposal, ctx);
   return { proposal, summary, memoryFile: file };
 }
 
