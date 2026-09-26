@@ -1,5 +1,7 @@
 # Reuse Backpass evidence as PAB improvement fuel
 
+> **Deferred archive (2026-09-26):** This exporter is preserved on the parking branch and is not active on `main`. The direct integration is not approved for reactivation. See the [authority and deferral decision](decisions/2026-09-26-backpass-pab-integration-deferred.md), including the repository-owner conversation source.
+
 Backpass keeps a saved proposal in the repository-local `.backpass/proposal.json`. From the correction repository:
 
 ```sh
